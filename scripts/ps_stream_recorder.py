@@ -147,6 +147,227 @@ class OpusDecoder:
                 pass
 
 # ---------------------------------------------------------------------------
+# Controller input via evdev (DualSense / DualShock)
+# ---------------------------------------------------------------------------
+
+_evdev_available = False
+try:
+    import evdev
+    from evdev import ecodes
+    _evdev_available = True
+except ImportError:
+    pass
+
+
+# ChiakiControllerButton bitmask values
+CONTROLLER_BUTTON_CROSS      = (1 << 0)
+CONTROLLER_BUTTON_MOON       = (1 << 1)
+CONTROLLER_BUTTON_BOX        = (1 << 2)
+CONTROLLER_BUTTON_PYRAMID    = (1 << 3)
+CONTROLLER_BUTTON_DPAD_LEFT  = (1 << 4)
+CONTROLLER_BUTTON_DPAD_RIGHT = (1 << 5)
+CONTROLLER_BUTTON_DPAD_UP    = (1 << 6)
+CONTROLLER_BUTTON_DPAD_DOWN  = (1 << 7)
+CONTROLLER_BUTTON_L1         = (1 << 8)
+CONTROLLER_BUTTON_R1         = (1 << 9)
+CONTROLLER_BUTTON_L3         = (1 << 10)
+CONTROLLER_BUTTON_R3         = (1 << 11)
+CONTROLLER_BUTTON_OPTIONS    = (1 << 12)
+CONTROLLER_BUTTON_SHARE      = (1 << 13)
+CONTROLLER_BUTTON_TOUCHPAD   = (1 << 14)
+CONTROLLER_BUTTON_PS         = (1 << 15)
+
+# evdev button code -> chiaki button bitmask
+_EVDEV_BUTTON_MAP = {}
+if _evdev_available:
+    _EVDEV_BUTTON_MAP = {
+        ecodes.BTN_SOUTH:  CONTROLLER_BUTTON_CROSS,
+        ecodes.BTN_EAST:   CONTROLLER_BUTTON_MOON,
+        ecodes.BTN_NORTH:  CONTROLLER_BUTTON_PYRAMID,
+        ecodes.BTN_WEST:   CONTROLLER_BUTTON_BOX,
+        ecodes.BTN_TL:     CONTROLLER_BUTTON_L1,
+        ecodes.BTN_TR:     CONTROLLER_BUTTON_R1,
+        ecodes.BTN_THUMBL: CONTROLLER_BUTTON_L3,
+        ecodes.BTN_THUMBR: CONTROLLER_BUTTON_R3,
+        ecodes.BTN_START:  CONTROLLER_BUTTON_OPTIONS,
+        ecodes.BTN_SELECT: CONTROLLER_BUTTON_SHARE,
+        ecodes.BTN_MODE:   CONTROLLER_BUTTON_PS,
+    }
+
+
+class ChiakiControllerTouch(ctypes.Structure):
+    _fields_ = [
+        ("x", ctypes.c_uint16),
+        ("y", ctypes.c_uint16),
+        ("id", ctypes.c_int8),
+    ]
+
+CHIAKI_CONTROLLER_TOUCHES_MAX = 2
+
+
+class ChiakiControllerState(ctypes.Structure):
+    _fields_ = [
+        ("buttons", ctypes.c_uint32),
+        ("l2_state", ctypes.c_uint8),
+        ("r2_state", ctypes.c_uint8),
+        ("_pad0", ctypes.c_uint8 * 2),
+        ("left_x", ctypes.c_int16),
+        ("left_y", ctypes.c_int16),
+        ("right_x", ctypes.c_int16),
+        ("right_y", ctypes.c_int16),
+        ("touch_id_next", ctypes.c_uint8),
+        ("_pad1", ctypes.c_uint8),
+        ("touches", ChiakiControllerTouch * CHIAKI_CONTROLLER_TOUCHES_MAX),
+        ("gyro_x", ctypes.c_float),
+        ("gyro_y", ctypes.c_float),
+        ("gyro_z", ctypes.c_float),
+        ("accel_x", ctypes.c_float),
+        ("accel_y", ctypes.c_float),
+        ("accel_z", ctypes.c_float),
+        ("orient_x", ctypes.c_float),
+        ("orient_y", ctypes.c_float),
+        ("orient_z", ctypes.c_float),
+        ("orient_w", ctypes.c_float),
+    ]
+
+
+def find_dualsense_device():
+    """Find the DualSense/DualShock gamepad evdev device."""
+    if not _evdev_available:
+        raise RuntimeError(
+            "evdev not available. Install with: pip install evdev\n"
+            "  or: sudo dnf install python3-evdev"
+        )
+    devices = [evdev.InputDevice(path) for path in evdev.list_devices()]
+    for dev in devices:
+        name_lower = dev.name.lower()
+        caps = dev.capabilities(verbose=False)
+        # Match DualSense/DualShock gamepad node (has EV_KEY with BTN_SOUTH)
+        if ("dualsense" in name_lower or "dualshock" in name_lower
+                or "wireless controller" in name_lower):
+            ev_key = caps.get(ecodes.EV_KEY, [])
+            if ecodes.BTN_SOUTH in ev_key:
+                return dev
+    # Fallback: any gamepad with BTN_SOUTH + ABS_X
+    for dev in devices:
+        caps = dev.capabilities(verbose=False)
+        ev_key = caps.get(ecodes.EV_KEY, [])
+        ev_abs = caps.get(ecodes.EV_ABS, [])
+        abs_codes = [a[0] if isinstance(a, tuple) else a for a in ev_abs]
+        if ecodes.BTN_SOUTH in ev_key and ecodes.ABS_X in abs_codes:
+            return dev
+    raise RuntimeError(
+        "No gamepad found. Connect a DualSense/DualShock controller.\n"
+        "  Check with: evtest"
+    )
+
+
+def _stick_evdev_to_chiaki(value):
+    """Convert evdev stick value (0-255, center=128) to chiaki int16."""
+    return max(-32768, min(32767, (value - 128) * 256))
+
+
+class ControllerInputThread:
+    """
+    Reads a DualSense/DualShock controller via evdev and sends
+    controller state to a chiaki session.
+    """
+
+    def __init__(self, lib, session_ptr, device_path=None, log_fn=None):
+        self._lib = lib
+        self._session_ptr = session_ptr
+        self._device_path = device_path
+        self._log = log_fn or (lambda msg: print(msg, file=sys.stderr))
+        self._stop_event = threading.Event()
+        self._thread = None
+        self._state = ChiakiControllerState()
+        ctypes.memset(ctypes.byref(self._state), 0, ctypes.sizeof(self._state))
+        for i in range(CHIAKI_CONTROLLER_TOUCHES_MAX):
+            self._state.touches[i].id = -1
+
+    def start(self):
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._stop_event.set()
+        if self._thread:
+            self._thread.join(timeout=2)
+
+    def _send_state(self):
+        self._lib.chiaki_session_set_controller_state(
+            self._session_ptr, ctypes.byref(self._state)
+        )
+
+    def _run(self):
+        try:
+            if self._device_path:
+                dev = evdev.InputDevice(self._device_path)
+            else:
+                dev = find_dualsense_device()
+            self._log(f"[+] Controller: {dev.name} ({dev.path})")
+        except Exception as e:
+            self._log(f"[!] Controller error: {e}")
+            return
+
+        try:
+            import select as _select
+            while not self._stop_event.is_set():
+                r, _, _ = _select.select([dev.fd], [], [], 0.1)
+                if not r:
+                    continue
+                for event in dev.read():
+                    if event.type == ecodes.EV_KEY:
+                        chiaki_btn = _EVDEV_BUTTON_MAP.get(event.code)
+                        if chiaki_btn:
+                            if event.value:
+                                self._state.buttons |= chiaki_btn
+                            else:
+                                self._state.buttons &= ~chiaki_btn
+                            self._send_state()
+
+                    elif event.type == ecodes.EV_ABS:
+                        code = event.code
+                        val = event.value
+
+                        if code == ecodes.ABS_X:
+                            self._state.left_x = _stick_evdev_to_chiaki(val)
+                        elif code == ecodes.ABS_Y:
+                            self._state.left_y = _stick_evdev_to_chiaki(val)
+                        elif code == ecodes.ABS_RX:
+                            self._state.right_x = _stick_evdev_to_chiaki(val)
+                        elif code == ecodes.ABS_RY:
+                            self._state.right_y = _stick_evdev_to_chiaki(val)
+                        elif code == ecodes.ABS_Z:
+                            self._state.l2_state = val & 0xFF
+                        elif code == ecodes.ABS_RZ:
+                            self._state.r2_state = val & 0xFF
+                        elif code == ecodes.ABS_HAT0X:
+                            self._state.buttons &= ~(CONTROLLER_BUTTON_DPAD_LEFT | CONTROLLER_BUTTON_DPAD_RIGHT)
+                            if val < 0:
+                                self._state.buttons |= CONTROLLER_BUTTON_DPAD_LEFT
+                            elif val > 0:
+                                self._state.buttons |= CONTROLLER_BUTTON_DPAD_RIGHT
+                        elif code == ecodes.ABS_HAT0Y:
+                            self._state.buttons &= ~(CONTROLLER_BUTTON_DPAD_UP | CONTROLLER_BUTTON_DPAD_DOWN)
+                            if val < 0:
+                                self._state.buttons |= CONTROLLER_BUTTON_DPAD_UP
+                            elif val > 0:
+                                self._state.buttons |= CONTROLLER_BUTTON_DPAD_DOWN
+                        else:
+                            continue
+                        self._send_state()
+        except Exception as e:
+            if not self._stop_event.is_set():
+                self._log(f"[!] Controller read error: {e}")
+        finally:
+            try:
+                dev.close()
+            except Exception:
+                pass
+
+
+# ---------------------------------------------------------------------------
 # Constants from chiaki-ng headers
 # ---------------------------------------------------------------------------
 
@@ -978,7 +1199,8 @@ class StreamOutput:
                  verbose=False,
                  # Output mode (exactly one should be set)
                  pipe_stdout=False, fifo_path=None, v4l2_device=None,
-                 hw_decoder=None):
+                 hw_decoder=None,
+                 controller_device=None):
         self.host = host
         self.regist_key = regist_key
         self.morning = morning
@@ -995,6 +1217,7 @@ class StreamOutput:
         self.fifo_path = fifo_path
         self.v4l2_device = v4l2_device
         self.hw_decoder = hw_decoder  # "vaapi", "nvdec", "vdpau", etc.
+        self.controller_device = controller_device  # evdev path or "auto"
 
         self._lib = load_libchiaki(lib_path)
         self._stop_event = threading.Event()
@@ -1012,6 +1235,7 @@ class StreamOutput:
         self._video_fd = None
         self._ffmpeg_proc = None
         self._v4l2_fd = None
+        self._controller_input = None
 
     def _open_output(self):
         """Open the output destination based on mode."""
@@ -1284,6 +1508,14 @@ class StreamOutput:
                 self._lib.chiaki_session_fini(session_ptr)
                 raise RuntimeError(f"chiaki_session_start failed: {self._lib.chiaki_error_string(err).decode()}")
 
+            # Start controller input if requested
+            if self.controller_device:
+                dev_path = None if self.controller_device == "auto" else self.controller_device
+                self._controller_input = ControllerInputThread(
+                    self._lib, session_ptr, device_path=dev_path, log_fn=log
+                )
+                self._controller_input.start()
+
             log("[+] Streaming... (Ctrl+C to stop)")
 
             def signal_handler(sig, frame):
@@ -1298,6 +1530,9 @@ class StreamOutput:
                     self._stop_event.wait()
             finally:
                 signal.signal(signal.SIGINT, old_handler)
+
+            if self._controller_input:
+                self._controller_input.stop()
 
             self._lib.chiaki_session_stop(session_ptr)
             self._lib.chiaki_session_join(session_ptr)
@@ -1711,6 +1946,9 @@ Examples:
     # GPU decoder for v4l2 mode
     stream_parser.add_argument("--hw-decoder", choices=["vaapi", "nvdec", "vdpau", "vulkan"],
                                help="GPU decoder for v4l2 mode (default: software)")
+    stream_parser.add_argument("--controller", nargs="?", const="auto", default=None,
+                               metavar="DEVICE",
+                               help="Enable controller input (auto-detect or specify /dev/input/eventX)")
 
     args = parser.parse_args()
 
@@ -1921,6 +2159,7 @@ Examples:
             verbose=args.verbose,
             pipe_stdout=pipe_stdout, fifo_path=args.fifo,
             v4l2_device=args.v4l2, hw_decoder=args.hw_decoder,
+            controller_device=args.controller,
         )
         streamer.stream()
 
