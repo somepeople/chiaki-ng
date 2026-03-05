@@ -276,7 +276,6 @@ class ControllerInputThread:
     def __init__(self, lib, session_ptr, device_path=None, log_fn=None):
         self._lib = lib
         self._session_ptr = session_ptr
-        self._device_path = device_path
         self._log = log_fn or (lambda msg: print(msg, file=sys.stderr))
         self._stop_event = threading.Event()
         self._thread = None
@@ -284,6 +283,13 @@ class ControllerInputThread:
         ctypes.memset(ctypes.byref(self._state), 0, ctypes.sizeof(self._state))
         for i in range(CHIAKI_CONTROLLER_TOUCHES_MAX):
             self._state.touches[i].id = -1
+
+        # Detect controller immediately (raises on failure)
+        if device_path:
+            self._device = evdev.InputDevice(device_path)
+        else:
+            self._device = find_dualsense_device()
+        self._log(f"[+] Controller: {self._device.name} ({self._device.path})")
 
     def start(self):
         self._thread = threading.Thread(target=self._run, daemon=True)
@@ -300,16 +306,7 @@ class ControllerInputThread:
         )
 
     def _run(self):
-        try:
-            if self._device_path:
-                dev = evdev.InputDevice(self._device_path)
-            else:
-                dev = find_dualsense_device()
-            self._log(f"[+] Controller: {dev.name} ({dev.path})")
-        except Exception as e:
-            self._log(f"[!] Controller error: {e}")
-            return
-
+        dev = self._device
         try:
             import select as _select
             while not self._stop_event.is_set():
