@@ -328,13 +328,13 @@ class ControllerInputThread:
                         val = event.value
 
                         if code == ecodes.ABS_X:
-                            self._state.left_x = _stick_evdev_to_chiaki(val)
-                        elif code == ecodes.ABS_Y:
                             self._state.left_y = _stick_evdev_to_chiaki(val)
+                        elif code == ecodes.ABS_Y:
+                            self._state.left_x = _stick_evdev_to_chiaki(val)
                         elif code == ecodes.ABS_RX:
-                            self._state.right_x = _stick_evdev_to_chiaki(val)
-                        elif code == ecodes.ABS_RY:
                             self._state.right_y = _stick_evdev_to_chiaki(val)
+                        elif code == ecodes.ABS_RY:
+                            self._state.right_x = _stick_evdev_to_chiaki(val)
                         elif code == ecodes.ABS_Z:
                             self._state.l2_state = val & 0xFF
                         elif code == ecodes.ABS_RZ:
