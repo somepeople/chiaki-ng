@@ -36,8 +36,9 @@ Usage:
     # Or use a config file
     python3 ps_stream_recorder.py record --config ps_config.json --output recording.mp4
 
-    # 4) Stream raw H.264 to stdout (pipe to another app)
-    python3 ps_stream_recorder.py stream --config ps_config.json | ffplay -
+    # 4) Stream raw H.264 to stdout (pipe to another app, low-latency)
+    python3 ps_stream_recorder.py stream --config ps_config.json | \
+        ffplay -fflags nobuffer -flags low_delay -framedrop -f h264 -
 
     # 5) Stream to a named pipe (FIFO)
     python3 ps_stream_recorder.py stream --config ps_config.json --fifo /tmp/ps_video
@@ -1313,7 +1314,15 @@ class StreamOutput:
         pix_fmt = "yuv420p"
 
         # Build FFmpeg command: decode H.264 → write raw YUV to v4l2 device
-        cmd = ["ffmpeg", "-y",
+        # Low-latency flags: no buffering, real-time output, minimal probing
+        base_flags = [
+            "-fflags", "nobuffer",
+            "-flags", "low_delay",
+            "-probesize", "32",
+            "-analyzeduration", "0",
+        ]
+
+        cmd = ["ffmpeg", "-y"] + base_flags + [
                "-f", codec_name,
                "-i", "pipe:0"]
 
@@ -1326,7 +1335,7 @@ class StreamOutput:
                     if os.path.exists(candidate):
                         render_node = candidate
                         break
-                cmd = ["ffmpeg", "-y",
+                cmd = ["ffmpeg", "-y"] + base_flags + [
                        "-hwaccel", "vaapi",
                        "-hwaccel_output_format", "vaapi",
                        "-vaapi_device", render_node,
@@ -1334,17 +1343,17 @@ class StreamOutput:
                        "-vf", "scale_vaapi=format=nv12,hwdownload,format=nv12,format=yuv420p"]
                 pix_fmt = "yuv420p"
             elif self.hw_decoder == "nvdec":
-                cmd = ["ffmpeg", "-y",
+                cmd = ["ffmpeg", "-y"] + base_flags + [
                        "-hwaccel", "cuda", "-hwaccel_output_format", "cuda",
                        "-f", codec_name, "-i", "pipe:0",
                        "-vf", "hwdownload,format=nv12"]
                 pix_fmt = "nv12"
             elif self.hw_decoder == "vdpau":
-                cmd = ["ffmpeg", "-y",
+                cmd = ["ffmpeg", "-y"] + base_flags + [
                        "-hwaccel", "vdpau",
                        "-f", codec_name, "-i", "pipe:0"]
             else:
-                cmd = ["ffmpeg", "-y",
+                cmd = ["ffmpeg", "-y"] + base_flags + [
                        "-hwaccel", self.hw_decoder,
                        "-f", codec_name, "-i", "pipe:0"]
 
@@ -1904,8 +1913,14 @@ Examples:
   # Record using a saved config
   %(prog)s record --config ps_config.json --output recording.mp4
 
-  # Stream raw H.264 to stdout (pipe to ffplay, mpv, gstreamer, etc.)
-  %(prog)s stream --config ps_config.json | ffplay -f h264 -
+  # Stream raw H.264 to stdout (low-latency playback with ffplay)
+  %(prog)s stream --config ps_config.json | \\
+      ffplay -fflags nobuffer -flags low_delay -framedrop \\
+             -probesize 32 -analyzeduration 0 -f h264 -
+
+  # Stream to stdout (low-latency playback with mpv)
+  %(prog)s stream --config ps_config.json | \\
+      mpv --no-cache --untimed --no-demuxer-thread --profile=low-latency -
 
   # Stream to a named pipe (FIFO)
   %(prog)s stream --config ps_config.json --fifo /tmp/ps_video
@@ -1984,6 +1999,8 @@ Examples:
     stream_parser.add_argument("--controller", nargs="?", const="auto", default=None,
                                metavar="DEVICE",
                                help="Enable controller input (auto-detect or specify /dev/input/eventX)")
+    stream_parser.add_argument("--play", action="store_true",
+                               help="Launch ffplay with low-latency flags on the v4l2 device (requires --v4l2)")
 
     args = parser.parse_args()
 
@@ -2185,6 +2202,29 @@ Examples:
         if args.hw_decoder and not args.v4l2:
             print("[!] --hw-decoder only applies to --v4l2 mode", file=sys.stderr)
             sys.exit(1)
+        if args.play and not args.v4l2:
+            print("[!] --play requires --v4l2", file=sys.stderr)
+            sys.exit(1)
+
+        # Launch low-latency ffplay on the v4l2 device
+        ffplay_proc = None
+        if args.play:
+            ffplay_cmd = [
+                "ffplay",
+                "-fflags", "nobuffer",
+                "-flags", "low_delay",
+                "-framedrop",
+                "-probesize", "32",
+                "-analyzeduration", "0",
+                "-vf", "setpts=0",
+                args.v4l2,
+            ]
+            print(f"[+] ffplay: {' '.join(ffplay_cmd)}", file=sys.stderr)
+            ffplay_proc = subprocess.Popen(
+                ffplay_cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=None if args.verbose else subprocess.DEVNULL,
+            )
 
         streamer = StreamOutput(
             host=host, regist_key=regist_key, morning=morning,
@@ -2196,7 +2236,12 @@ Examples:
             v4l2_device=args.v4l2, hw_decoder=args.hw_decoder,
             controller_device=args.controller,
         )
-        streamer.stream()
+        try:
+            streamer.stream()
+        finally:
+            if ffplay_proc:
+                ffplay_proc.terminate()
+                ffplay_proc.wait(timeout=5)
 
 
 if __name__ == "__main__":
