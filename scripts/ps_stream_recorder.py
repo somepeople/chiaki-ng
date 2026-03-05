@@ -1039,6 +1039,17 @@ class StreamOutput:
 
     def _open_v4l2_output(self):
         """Open v4l2loopback device via FFmpeg decode+write pipeline."""
+        # Validate v4l2 device exists before launching FFmpeg
+        if not os.path.exists(self.v4l2_device):
+            # Try to find available v4l2loopback devices
+            import glob as glob_mod
+            avail = glob_mod.glob("/dev/video*")
+            hint = f" (available: {', '.join(sorted(avail))})" if avail else ""
+            raise RuntimeError(
+                f"V4L2 device {self.v4l2_device} does not exist{hint}.\n"
+                f"  Load v4l2loopback first: sudo modprobe v4l2loopback video_nr=9"
+            )
+
         codec_name = "h264" if self.codec == CODEC_H264 else "hevc"
         pix_fmt = "yuv420p"
 
@@ -1050,10 +1061,18 @@ class StreamOutput:
         # GPU-accelerated decoding
         if self.hw_decoder:
             if self.hw_decoder == "vaapi":
+                # Auto-detect VAAPI render node
+                render_node = "/dev/dri/renderD128"
+                for candidate in ["/dev/dri/renderD128", "/dev/dri/renderD129"]:
+                    if os.path.exists(candidate):
+                        render_node = candidate
+                        break
                 cmd = ["ffmpeg", "-y",
-                       "-vaapi_device", "/dev/dri/renderD128",
+                       "-hwaccel", "vaapi",
+                       "-hwaccel_output_format", "vaapi",
+                       "-vaapi_device", render_node,
                        "-f", codec_name, "-i", "pipe:0",
-                       "-vf", "hwupload,scale_vaapi=format=nv12,hwdownload,format=nv12"]
+                       "-vf", "scale_vaapi=format=nv12,hwdownload,format=nv12"]
                 pix_fmt = "nv12"
             elif self.hw_decoder == "nvdec":
                 cmd = ["ffmpeg", "-y",
