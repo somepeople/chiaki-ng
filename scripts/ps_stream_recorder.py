@@ -1072,8 +1072,8 @@ class StreamOutput:
                        "-hwaccel_output_format", "vaapi",
                        "-vaapi_device", render_node,
                        "-f", codec_name, "-i", "pipe:0",
-                       "-vf", "scale_vaapi=format=nv12,hwdownload,format=nv12"]
-                pix_fmt = "nv12"
+                       "-vf", "scale_vaapi=format=nv12,hwdownload,format=nv12,format=yuv420p"]
+                pix_fmt = "yuv420p"
             elif self.hw_decoder == "nvdec":
                 cmd = ["ffmpeg", "-y",
                        "-hwaccel", "cuda", "-hwaccel_output_format", "cuda",
