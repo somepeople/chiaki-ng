@@ -262,9 +262,20 @@ def find_dualsense_device():
     )
 
 
-def _stick_evdev_to_chiaki(value):
-    """Convert evdev stick value (0-255, center=128) to chiaki int16."""
-    return max(-32768, min(32767, (value - 128) * 256))
+def _make_axis_converter(absinfo):
+    """Return a function that converts an evdev axis value to chiaki int16
+    using the real min/max reported by the device."""
+    lo = absinfo.min
+    hi = absinfo.max
+    mid = (lo + hi) / 2.0
+    half = (hi - lo) / 2.0 or 1.0  # avoid division by zero
+
+    def convert(value):
+        normalized = (value - mid) / half          # -1.0 .. +1.0
+        scaled = int(normalized * 32767)
+        return max(-32768, min(32767, scaled))
+
+    return convert
 
 
 class ControllerInputThread:
@@ -290,6 +301,28 @@ class ControllerInputThread:
         else:
             self._device = find_dualsense_device()
         self._log(f"[+] Controller: {self._device.name} ({self._device.path})")
+
+        # Build per-axis converters from the device's real absinfo
+        self._axis_conv = {}
+        for axis_code in (ecodes.ABS_X, ecodes.ABS_Y,
+                          ecodes.ABS_RX, ecodes.ABS_RY):
+            try:
+                info = self._device.absinfo(axis_code)
+                self._axis_conv[axis_code] = _make_axis_converter(info)
+            except (KeyError, OSError):
+                pass
+
+        # Trigger converters (0..255 → 0..255, identity)
+        self._trigger_conv = {}
+        for axis_code in (ecodes.ABS_Z, ecodes.ABS_RZ):
+            try:
+                info = self._device.absinfo(axis_code)
+                lo, hi = info.min, info.max
+                span = (hi - lo) or 1
+                self._trigger_conv[axis_code] = lambda v, lo=lo, span=span: \
+                    max(0, min(255, int((v - lo) / span * 255)))
+            except (KeyError, OSError):
+                pass
 
     def start(self):
         self._thread = threading.Thread(target=self._run, daemon=True)
@@ -328,17 +361,23 @@ class ControllerInputThread:
                         val = event.value
 
                         if code == ecodes.ABS_X:
-                            self._state.left_y = _stick_evdev_to_chiaki(val)
+                            conv = self._axis_conv.get(code)
+                            self._state.left_x = conv(val) if conv else val
                         elif code == ecodes.ABS_Y:
-                            self._state.left_x = _stick_evdev_to_chiaki(val)
+                            conv = self._axis_conv.get(code)
+                            self._state.left_y = conv(val) if conv else val
                         elif code == ecodes.ABS_RX:
-                            self._state.right_y = _stick_evdev_to_chiaki(val)
+                            conv = self._axis_conv.get(code)
+                            self._state.right_x = conv(val) if conv else val
                         elif code == ecodes.ABS_RY:
-                            self._state.right_x = _stick_evdev_to_chiaki(val)
+                            conv = self._axis_conv.get(code)
+                            self._state.right_y = conv(val) if conv else val
                         elif code == ecodes.ABS_Z:
-                            self._state.l2_state = val & 0xFF
+                            conv = self._trigger_conv.get(code)
+                            self._state.l2_state = conv(val) if conv else (val & 0xFF)
                         elif code == ecodes.ABS_RZ:
-                            self._state.r2_state = val & 0xFF
+                            conv = self._trigger_conv.get(code)
+                            self._state.r2_state = conv(val) if conv else (val & 0xFF)
                         elif code == ecodes.ABS_HAT0X:
                             self._state.buttons &= ~(CONTROLLER_BUTTON_DPAD_LEFT | CONTROLLER_BUTTON_DPAD_RIGHT)
                             if val < 0:
