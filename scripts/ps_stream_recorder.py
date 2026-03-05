@@ -36,6 +36,16 @@ Usage:
     # Or use a config file
     python3 ps_stream_recorder.py record --config ps_config.json --output recording.mp4
 
+    # 4) Stream raw H.264 to stdout (pipe to another app)
+    python3 ps_stream_recorder.py stream --config ps_config.json | ffplay -
+
+    # 5) Stream to a named pipe (FIFO)
+    python3 ps_stream_recorder.py stream --config ps_config.json --fifo /tmp/ps_video
+
+    # 6) Stream to a v4l2loopback virtual camera (GPU-decoded)
+    sudo modprobe v4l2loopback video_nr=9
+    python3 ps_stream_recorder.py stream --config ps_config.json --v4l2 /dev/video9
+
 License: AGPL-3.0-only-OpenSSL (same as chiaki-ng)
 """
 
@@ -945,6 +955,343 @@ class StreamRecorder:
 
 
 # ---------------------------------------------------------------------------
+# Low-latency streaming output (pipe / FIFO / v4l2loopback)
+# ---------------------------------------------------------------------------
+
+class StreamOutput:
+    """
+    Streams a PlayStation Remote Play video stream with minimal latency.
+
+    Output modes (from fastest to slowest):
+      - stdout:  Raw H.264/H.265 NAL units to stdout (zero overhead)
+      - fifo:    Raw H.264/H.265 to a named pipe (FIFO)
+      - v4l2:    GPU-decoded YUV frames to /dev/videoN via v4l2loopback
+
+    For stdout/fifo modes, the consumer application does the decoding,
+    which avoids an extra decode+encode cycle and keeps latency minimal.
+    """
+
+    def __init__(self, host, regist_key, morning,
+                 ps5=False, codec=CODEC_H264,
+                 width=1920, height=1080, fps=60, bitrate=15000,
+                 duration=None, psn_account_id=None, lib_path=None,
+                 verbose=False,
+                 # Output mode (exactly one should be set)
+                 pipe_stdout=False, fifo_path=None, v4l2_device=None,
+                 hw_decoder=None):
+        self.host = host
+        self.regist_key = regist_key
+        self.morning = morning
+        self.ps5 = ps5
+        self.codec = codec
+        self.width = width
+        self.height = height
+        self.fps = fps
+        self.bitrate = bitrate
+        self.duration = duration
+        self.psn_account_id = psn_account_id or bytes(PSN_ACCOUNT_ID_SIZE)
+        self.verbose = verbose
+        self.pipe_stdout = pipe_stdout
+        self.fifo_path = fifo_path
+        self.v4l2_device = v4l2_device
+        self.hw_decoder = hw_decoder  # "vaapi", "nvdec", "vdpau", etc.
+
+        self._lib = load_libchiaki(lib_path)
+        self._stop_event = threading.Event()
+        self._video_frames = 0
+        self._audio_frames = 0
+        self._start_time = None
+
+        # Callback references (prevent GC)
+        self._event_cb_ref = None
+        self._video_cb_ref = None
+        self._audio_header_cb_ref = None
+        self._audio_frame_cb_ref = None
+
+        # Output file descriptors
+        self._video_fd = None
+        self._ffmpeg_proc = None
+        self._v4l2_fd = None
+
+    def _open_output(self):
+        """Open the output destination based on mode."""
+        if self.pipe_stdout:
+            # Write raw H.264/H.265 directly to stdout (fd 1)
+            self._video_fd = 1  # stdout
+            # Redirect status messages to stderr so they don't mix with stream
+            return
+
+        if self.fifo_path:
+            # Create FIFO if it doesn't exist
+            if not os.path.exists(self.fifo_path):
+                os.mkfifo(self.fifo_path)
+                print(f"[+] Created FIFO: {self.fifo_path}", file=sys.stderr)
+            elif not os.path.isfifo(self.fifo_path):
+                raise RuntimeError(f"{self.fifo_path} exists but is not a FIFO")
+            print(f"[+] Opening FIFO {self.fifo_path} (waiting for reader...)", file=sys.stderr)
+            self._video_fd = os.open(self.fifo_path, os.O_WRONLY)
+            print(f"[+] FIFO reader connected", file=sys.stderr)
+            return
+
+        if self.v4l2_device:
+            self._open_v4l2_output()
+            return
+
+    def _open_v4l2_output(self):
+        """Open v4l2loopback device via FFmpeg decode+write pipeline."""
+        codec_name = "h264" if self.codec == CODEC_H264 else "hevc"
+        pix_fmt = "yuv420p"
+
+        # Build FFmpeg command: decode H.264 → write raw YUV to v4l2 device
+        cmd = ["ffmpeg", "-y",
+               "-f", codec_name,
+               "-i", "pipe:0"]
+
+        # GPU-accelerated decoding
+        if self.hw_decoder:
+            if self.hw_decoder == "vaapi":
+                cmd = ["ffmpeg", "-y",
+                       "-vaapi_device", "/dev/dri/renderD128",
+                       "-f", codec_name, "-i", "pipe:0",
+                       "-vf", "hwupload,scale_vaapi=format=nv12,hwdownload,format=nv12"]
+                pix_fmt = "nv12"
+            elif self.hw_decoder == "nvdec":
+                cmd = ["ffmpeg", "-y",
+                       "-hwaccel", "cuda", "-hwaccel_output_format", "cuda",
+                       "-f", codec_name, "-i", "pipe:0",
+                       "-vf", "hwdownload,format=nv12"]
+                pix_fmt = "nv12"
+            elif self.hw_decoder == "vdpau":
+                cmd = ["ffmpeg", "-y",
+                       "-hwaccel", "vdpau",
+                       "-f", codec_name, "-i", "pipe:0"]
+            else:
+                cmd = ["ffmpeg", "-y",
+                       "-hwaccel", self.hw_decoder,
+                       "-f", codec_name, "-i", "pipe:0"]
+
+        cmd.extend([
+            "-f", "v4l2",
+            "-pix_fmt", pix_fmt,
+            self.v4l2_device,
+        ])
+
+        print(f"[+] v4l2 pipeline: {' '.join(cmd)}", file=sys.stderr)
+        self._ffmpeg_proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=None if self.verbose else subprocess.DEVNULL,
+        )
+        self._video_fd = self._ffmpeg_proc.stdin.fileno()
+
+    def _close_output(self):
+        """Close the output destination."""
+        if self._ffmpeg_proc:
+            try:
+                self._ffmpeg_proc.stdin.close()
+            except Exception:
+                pass
+            self._ffmpeg_proc.wait(timeout=5)
+            self._ffmpeg_proc = None
+        elif self._video_fd is not None and self._video_fd > 2:
+            try:
+                os.close(self._video_fd)
+            except OSError:
+                pass
+        # Clean up FIFO
+        if self.fifo_path and os.path.exists(self.fifo_path):
+            try:
+                os.unlink(self.fifo_path)
+            except OSError:
+                pass
+        self._video_fd = None
+
+    def _log(self, msg):
+        """Print to stderr to avoid mixing with stream data on stdout."""
+        print(msg, file=sys.stderr)
+
+    def _make_event_callback(self):
+        """Create the C callback for session events."""
+        CALLBACK_TYPE = ctypes.CFUNCTYPE(None, ctypes.c_void_p, ctypes.c_void_p)
+
+        def event_cb(event_ptr, user_ptr):
+            if not event_ptr:
+                return
+            event_type = ctypes.cast(event_ptr, ctypes.POINTER(ctypes.c_int))[0]
+            if event_type == EVENT_CONNECTED:
+                self._log("[+] Connected to PlayStation!")
+                self._start_time = time.time()
+            elif event_type == EVENT_QUIT:
+                quit_event_offset = 8
+                quit_reason = ctypes.cast(
+                    ctypes.c_void_p(event_ptr + quit_event_offset),
+                    ctypes.POINTER(ctypes.c_int)
+                )[0]
+                reason_str = "unknown"
+                try:
+                    reason_str = self._lib.chiaki_quit_reason_string(quit_reason).decode()
+                except Exception:
+                    pass
+                self._log(f"[+] Session ended: {reason_str}")
+                self._stop_event.set()
+
+        self._event_cb_ref = CALLBACK_TYPE(event_cb)
+        return self._event_cb_ref
+
+    def _make_video_callback(self):
+        """Create zero-copy video callback that writes directly to output fd."""
+        CALLBACK_TYPE = ctypes.CFUNCTYPE(
+            ctypes.c_bool,
+            ctypes.POINTER(ctypes.c_uint8), ctypes.c_size_t,
+            ctypes.c_int32, ctypes.c_bool, ctypes.c_void_p,
+        )
+
+        video_fd = self._video_fd
+
+        def video_cb(buf, buf_size, frames_lost, frame_recovered, user):
+            try:
+                data = ctypes.string_at(buf, buf_size)
+                os.write(video_fd, data)
+                self._video_frames += 1
+                if self._video_frames % 600 == 0:
+                    elapsed = time.time() - (self._start_time or time.time())
+                    self._log(f"  [stream] {self._video_frames} frames ({elapsed:.1f}s)")
+                return True
+            except BrokenPipeError:
+                self._log("[+] Pipe closed by reader, stopping...")
+                self._stop_event.set()
+                return False
+            except Exception as e:
+                self._log(f"[!] Video callback error: {e}")
+                return False
+
+        self._video_cb_ref = CALLBACK_TYPE(video_cb)
+        return self._video_cb_ref
+
+    def _make_audio_noop_callbacks(self):
+        """Create no-op audio callbacks (audio not used in stream mode)."""
+        HEADER_CB_TYPE = ctypes.CFUNCTYPE(None, ctypes.c_void_p, ctypes.c_void_p)
+        FRAME_CB_TYPE = ctypes.CFUNCTYPE(None, ctypes.POINTER(ctypes.c_uint8), ctypes.c_size_t, ctypes.c_void_p)
+
+        def noop_header(header_ptr, user):
+            pass
+
+        def noop_frame(buf, buf_size, user):
+            self._audio_frames += 1
+
+        self._audio_header_cb_ref = HEADER_CB_TYPE(noop_header)
+        self._audio_frame_cb_ref = FRAME_CB_TYPE(noop_frame)
+        return self._audio_header_cb_ref, self._audio_frame_cb_ref
+
+    def stream(self):
+        """
+        Main streaming function. Connects to PS and pipes video to output.
+        """
+        log = self._log
+        mode = "stdout" if self.pipe_stdout else ("FIFO" if self.fifo_path else "v4l2")
+        target = self.fifo_path or self.v4l2_device or "stdout"
+        log(f"[+] PS Stream → {mode}: {target}")
+        log(f"    {self.width}x{self.height}@{self.fps} {'H.265' if self.codec != CODEC_H264 else 'H.264'}")
+        if self.hw_decoder:
+            log(f"    GPU decode: {self.hw_decoder}")
+        if self.duration:
+            log(f"    Duration: {self.duration}s")
+
+        self._open_output()
+
+        try:
+            session_buf = ctypes.create_string_buffer(256 * 1024)
+
+            chiaki_log = ChiakiLog()
+            log_level = LOG_ALL if self.verbose else (LOG_WARNING | LOG_ERROR)
+            self._lib.chiaki_log_init(
+                ctypes.byref(chiaki_log),
+                ctypes.c_uint32(log_level),
+                ctypes.cast(self._lib.chiaki_log_cb_print, ctypes.c_void_p),
+                None,
+            )
+
+            connect_info = ChiakiConnectInfo()
+            ctypes.memset(ctypes.byref(connect_info), 0, ctypes.sizeof(connect_info))
+            connect_info.ps5 = self.ps5
+            connect_info.host = self.host.encode("utf-8")
+
+            rk = self.regist_key[:SESSION_AUTH_SIZE].ljust(SESSION_AUTH_SIZE, b'\x00')
+            ctypes.memmove(connect_info.regist_key, rk, SESSION_AUTH_SIZE)
+
+            m = self.morning[:RPCRYPT_KEY_SIZE]
+            ctypes.memmove(connect_info.morning, m, RPCRYPT_KEY_SIZE)
+
+            connect_info.video_profile.width = self.width
+            connect_info.video_profile.height = self.height
+            connect_info.video_profile.max_fps = self.fps
+            connect_info.video_profile.bitrate = self.bitrate
+            connect_info.video_profile.codec = self.codec if self.ps5 else CODEC_H264
+            connect_info.video_profile_auto_downgrade = True
+            connect_info.enable_dualsense = self.ps5
+            connect_info.audio_video_disabled = NONE_DISABLED
+            connect_info.packet_loss_max = 0.05
+            connect_info.enable_idr_on_fec_failure = True
+
+            if self.psn_account_id and len(self.psn_account_id) == PSN_ACCOUNT_ID_SIZE:
+                ctypes.memmove(connect_info.psn_account_id, self.psn_account_id, PSN_ACCOUNT_ID_SIZE)
+
+            err = self._lib.chiaki_session_init(
+                ctypes.cast(session_buf, ctypes.c_void_p),
+                ctypes.byref(connect_info),
+                ctypes.byref(chiaki_log),
+            )
+            if err != ERR_SUCCESS:
+                raise RuntimeError(f"chiaki_session_init failed: {self._lib.chiaki_error_string(err).decode()}")
+
+            session_ptr = ctypes.cast(session_buf, ctypes.c_void_p)
+
+            event_cb = self._make_event_callback()
+            self._lib.chiaki_session_set_event_cb(session_ptr, event_cb, None)
+
+            video_cb = self._make_video_callback()
+            self._lib.chiaki_session_set_video_sample_cb(session_ptr, video_cb, None)
+
+            audio_header_cb, audio_frame_cb = self._make_audio_noop_callbacks()
+            audio_sink = (ctypes.c_void_p * 3)()
+            audio_sink[0] = None
+            audio_sink[1] = ctypes.cast(audio_header_cb, ctypes.c_void_p)
+            audio_sink[2] = ctypes.cast(audio_frame_cb, ctypes.c_void_p)
+            self._lib.chiaki_session_set_audio_sink(session_ptr, ctypes.byref(audio_sink))
+
+            err = self._lib.chiaki_session_start(session_ptr)
+            if err != ERR_SUCCESS:
+                self._lib.chiaki_session_fini(session_ptr)
+                raise RuntimeError(f"chiaki_session_start failed: {self._lib.chiaki_error_string(err).decode()}")
+
+            log("[+] Streaming... (Ctrl+C to stop)")
+
+            def signal_handler(sig, frame):
+                log("\n[+] Stopping stream...")
+                self._stop_event.set()
+
+            old_handler = signal.signal(signal.SIGINT, signal_handler)
+            try:
+                if self.duration:
+                    self._stop_event.wait(timeout=self.duration)
+                else:
+                    self._stop_event.wait()
+            finally:
+                signal.signal(signal.SIGINT, old_handler)
+
+            self._lib.chiaki_session_stop(session_ptr)
+            self._lib.chiaki_session_join(session_ptr)
+            self._lib.chiaki_session_fini(session_ptr)
+
+            elapsed = time.time() - (self._start_time or time.time())
+            log(f"[+] Done: {self._video_frames} frames in {elapsed:.1f}s")
+
+        finally:
+            self._close_output()
+
+
+# ---------------------------------------------------------------------------
 # Alternative: Record using chiaki-ng subprocess (simpler approach)
 # ---------------------------------------------------------------------------
 
@@ -1268,6 +1615,16 @@ Examples:
   # Record using a saved config
   %(prog)s record --config ps_config.json --output recording.mp4
 
+  # Stream raw H.264 to stdout (pipe to ffplay, mpv, gstreamer, etc.)
+  %(prog)s stream --config ps_config.json | ffplay -f h264 -
+
+  # Stream to a named pipe (FIFO)
+  %(prog)s stream --config ps_config.json --fifo /tmp/ps_video
+
+  # Stream to v4l2loopback virtual camera (with GPU decode)
+  sudo modprobe v4l2loopback video_nr=9
+  %(prog)s stream --config ps_config.json --v4l2 /dev/video9 --hw-decoder vaapi
+
   # Wake up a console from standby
   %(prog)s wakeup --host 192.168.1.100 --regist-key <hex> --ps5
 """,
@@ -1312,6 +1669,29 @@ Examples:
     record_parser.add_argument("--lib-path", help="Path to libchiaki.so")
     record_parser.add_argument("--verbose", "-v", action="store_true", help="Verbose output")
     record_parser.add_argument("--fallback", action="store_true", help="Use screen capture fallback instead of direct")
+
+    # --- stream ---
+    stream_parser = subparsers.add_parser("stream", help="Stream raw video to stdout, FIFO, or v4l2 device")
+    stream_parser.add_argument("--host", help="Console IP address")
+    stream_parser.add_argument("--regist-key", help="Registration key (hex)")
+    stream_parser.add_argument("--morning", help="Morning/RP-key (hex)")
+    stream_parser.add_argument("--config", help="Load settings from JSON config file")
+    stream_parser.add_argument("--duration", "-d", type=int, help="Duration in seconds")
+    stream_parser.add_argument("--ps5", action="store_true", help="Target is PS5")
+    stream_parser.add_argument("--codec", choices=["h264", "h265", "h265-hdr"], default="h264", help="Video codec")
+    stream_parser.add_argument("--resolution", choices=["360p", "540p", "720p", "1080p"], default="1080p")
+    stream_parser.add_argument("--fps", type=int, choices=[30, 60], default=60)
+    stream_parser.add_argument("--bitrate", type=int, default=15000, help="Video bitrate in kbps")
+    stream_parser.add_argument("--psn-account-id", help="PSN Account ID (base64)")
+    stream_parser.add_argument("--lib-path", help="Path to libchiaki.so")
+    stream_parser.add_argument("--verbose", "-v", action="store_true", help="Verbose output")
+    # Output mode (mutually exclusive)
+    stream_output = stream_parser.add_mutually_exclusive_group()
+    stream_output.add_argument("--fifo", metavar="PATH", help="Write raw stream to a named pipe (FIFO)")
+    stream_output.add_argument("--v4l2", metavar="DEVICE", help="Write decoded frames to v4l2loopback (e.g. /dev/video9)")
+    # GPU decoder for v4l2 mode
+    stream_parser.add_argument("--hw-decoder", choices=["vaapi", "nvdec", "vdpau", "vulkan"],
+                               help="GPU decoder for v4l2 mode (default: software)")
 
     args = parser.parse_args()
 
@@ -1460,6 +1840,70 @@ Examples:
                 verbose=args.verbose,
             )
             recorder.record()
+
+    # === STREAM ===
+    elif args.command == "stream":
+        host = args.host
+        regist_key = None
+        morning = None
+        ps5 = args.ps5
+        psn_account_id = None
+
+        if args.config:
+            config = load_config(args.config)
+            host = host or config.get("host")
+            ps5 = config.get("ps5", ps5)
+            if config.get("regist_key"):
+                regist_key = bytes.fromhex(config["regist_key"])
+            if config.get("morning"):
+                morning = bytes.fromhex(config["morning"])
+            if config.get("psn_account_id"):
+                psn_account_id = base64.b64decode(config["psn_account_id"])
+
+        if args.regist_key:
+            regist_key = bytes.fromhex(args.regist_key)
+        if args.morning:
+            morning = bytes.fromhex(args.morning)
+        if args.psn_account_id:
+            psn_account_id = base64.b64decode(args.psn_account_id)
+
+        if morning is None:
+            print("[!] No morning/rp_key. Re-register first.", file=sys.stderr)
+            sys.exit(1)
+        if not host or not regist_key:
+            print("[!] --host and --regist-key required (or use --config)", file=sys.stderr)
+            sys.exit(1)
+        if len(regist_key) != SESSION_AUTH_SIZE:
+            print(f"[!] regist_key must be {SESSION_AUTH_SIZE} bytes", file=sys.stderr)
+            sys.exit(1)
+
+        res_map = {
+            "360p": (640, 360, 2000),
+            "540p": (960, 540, 6000),
+            "720p": (1280, 720, 10000),
+            "1080p": (1920, 1080, 15000),
+        }
+        width, height, default_bitrate = res_map[args.resolution]
+        bitrate = args.bitrate if args.bitrate != 15000 else default_bitrate
+        codec_map = {"h264": CODEC_H264, "h265": CODEC_H265, "h265-hdr": CODEC_H265_HDR}
+        codec = codec_map[args.codec]
+
+        # Determine output mode
+        pipe_stdout = not args.fifo and not args.v4l2
+        if args.hw_decoder and not args.v4l2:
+            print("[!] --hw-decoder only applies to --v4l2 mode", file=sys.stderr)
+            sys.exit(1)
+
+        streamer = StreamOutput(
+            host=host, regist_key=regist_key, morning=morning,
+            ps5=ps5, codec=codec, width=width, height=height,
+            fps=args.fps, bitrate=bitrate, duration=args.duration,
+            psn_account_id=psn_account_id, lib_path=args.lib_path,
+            verbose=args.verbose,
+            pipe_stdout=pipe_stdout, fifo_path=args.fifo,
+            v4l2_device=args.v4l2, hw_decoder=args.hw_decoder,
+        )
+        streamer.stream()
 
 
 if __name__ == "__main__":
