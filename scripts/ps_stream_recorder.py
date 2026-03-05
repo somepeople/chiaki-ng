@@ -444,7 +444,10 @@ class ChiakiConnectInfo(ctypes.Structure):
         ("ps5", ctypes.c_bool),
         ("_pad0", ctypes.c_uint8 * 7),                     # align to pointer
         ("host", ctypes.c_char_p),
-        ("regist_key", ctypes.c_char * SESSION_AUTH_SIZE),
+        # Use c_uint8 instead of c_char to avoid ctypes pitfall:
+        # accessing a c_char array field returns a bytes COPY, so memmove
+        # to it silently writes to a temporary. c_uint8 returns the actual array.
+        ("regist_key", ctypes.c_uint8 * SESSION_AUTH_SIZE),
         ("morning", ctypes.c_uint8 * RPCRYPT_KEY_SIZE),
         ("video_profile", ChiakiConnectVideoProfile),
         ("video_profile_auto_downgrade", ctypes.c_bool),
@@ -811,6 +814,15 @@ class StreamRecorder:
             # regist_key: 16 bytes, null-padded
             rk = self.regist_key[:SESSION_AUTH_SIZE].ljust(SESSION_AUTH_SIZE, b'\x00')
             ctypes.memmove(connect_info.regist_key, rk, SESSION_AUTH_SIZE)
+
+            # Verify regist_key was written correctly
+            rk_in_struct = bytes(connect_info.regist_key)
+            if rk_in_struct != rk:
+                print(f"[!] WARNING: regist_key mismatch after write!", file=sys.stderr)
+                print(f"    Expected: {rk.hex()}", file=sys.stderr)
+                print(f"    Got:      {rk_in_struct.hex()}", file=sys.stderr)
+            elif self.verbose:
+                print(f"[debug] regist_key in struct: {rk_in_struct.hex()}")
 
             # morning: 16 bytes - this MUST be the rp_key from registration
             m = self.morning[:RPCRYPT_KEY_SIZE]
