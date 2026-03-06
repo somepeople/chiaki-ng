@@ -1236,7 +1236,8 @@ class StreamOutput:
                  # Output mode (exactly one should be set)
                  pipe_stdout=False, fifo_path=None, v4l2_device=None,
                  hw_decoder=None,
-                 controller_device=None):
+                 controller_device=None,
+                 play=False):
         self.host = host
         self.regist_key = regist_key
         self.morning = morning
@@ -1254,6 +1255,7 @@ class StreamOutput:
         self.v4l2_device = v4l2_device
         self.hw_decoder = hw_decoder  # "vaapi", "nvdec", "vdpau", etc.
         self.controller_device = controller_device  # evdev path or "auto"
+        self.play = play  # launch ffplay on v4l2 device after writer opens
 
         self._lib = load_libchiaki(lib_path)
         self._stop_event = threading.Event()
@@ -1270,6 +1272,7 @@ class StreamOutput:
         # Output file descriptors
         self._video_fd = None
         self._ffmpeg_proc = None
+        self._ffplay_proc = None
         self._v4l2_fd = None
         self._controller_input = None
 
@@ -1487,6 +1490,27 @@ class StreamOutput:
 
         self._open_output()
 
+        # Launch ffplay AFTER the v4l2 writer has opened the device,
+        # so v4l2loopback advertises VIDEO_CAPTURE capability.
+        if self.play and self.v4l2_device:
+            time.sleep(0.5)  # let FFmpeg writer fully open the device
+            ffplay_cmd = [
+                "ffplay",
+                "-fflags", "nobuffer",
+                "-flags", "low_delay",
+                "-framedrop",
+                "-probesize", "32",
+                "-analyzeduration", "0",
+                "-vf", "setpts=0",
+                self.v4l2_device,
+            ]
+            log(f"[+] ffplay: {' '.join(ffplay_cmd)}")
+            self._ffplay_proc = subprocess.Popen(
+                ffplay_cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=None if self.verbose else subprocess.DEVNULL,
+            )
+
         try:
             session_buf = ctypes.create_string_buffer(256 * 1024)
 
@@ -1586,6 +1610,13 @@ class StreamOutput:
             log(f"[+] Done: {self._video_frames} frames in {elapsed:.1f}s")
 
         finally:
+            if self._ffplay_proc:
+                self._ffplay_proc.terminate()
+                try:
+                    self._ffplay_proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    self._ffplay_proc.kill()
+                self._ffplay_proc = None
             self._close_output()
 
 
@@ -2206,26 +2237,6 @@ Examples:
             print("[!] --play requires --v4l2", file=sys.stderr)
             sys.exit(1)
 
-        # Launch low-latency ffplay on the v4l2 device
-        ffplay_proc = None
-        if args.play:
-            ffplay_cmd = [
-                "ffplay",
-                "-fflags", "nobuffer",
-                "-flags", "low_delay",
-                "-framedrop",
-                "-probesize", "32",
-                "-analyzeduration", "0",
-                "-vf", "setpts=0",
-                args.v4l2,
-            ]
-            print(f"[+] ffplay: {' '.join(ffplay_cmd)}", file=sys.stderr)
-            ffplay_proc = subprocess.Popen(
-                ffplay_cmd,
-                stdout=subprocess.DEVNULL,
-                stderr=None if args.verbose else subprocess.DEVNULL,
-            )
-
         streamer = StreamOutput(
             host=host, regist_key=regist_key, morning=morning,
             ps5=ps5, codec=codec, width=width, height=height,
@@ -2235,13 +2246,9 @@ Examples:
             pipe_stdout=pipe_stdout, fifo_path=args.fifo,
             v4l2_device=args.v4l2, hw_decoder=args.hw_decoder,
             controller_device=args.controller,
+            play=args.play,
         )
-        try:
-            streamer.stream()
-        finally:
-            if ffplay_proc:
-                ffplay_proc.terminate()
-                ffplay_proc.wait(timeout=5)
+        streamer.stream()
 
 
 if __name__ == "__main__":
