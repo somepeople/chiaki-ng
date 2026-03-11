@@ -2053,21 +2053,11 @@ class TextDetector:
         """Preprocessing pipeline for OCR accuracy.
 
         Steps:
-          1. Cubic upscale for small ROIs (< 60px height)
-          2. CLAHE on luminance (contrast normalization)
-          3. Bilateral denoise (edge-preserving)
-          4. Unsharp mask (sharpen text contours)
-        Returns (processed_bgr, processed_gray, scale_factor).
+          1. CLAHE on luminance (contrast normalization)
+          2. Bilateral denoise (edge-preserving)
+          3. Unsharp mask (sharpen text contours)
+        Returns (processed_bgr, processed_gray).
         """
-        h, w = roi_img.shape[:2]
-
-        # Upscale small ROIs (cubic interpolation for speed)
-        scale = 1
-        if h < 60:
-            scale = max(2, 60 // h)
-            roi_img = cv2.resize(roi_img, (w * scale, h * scale),
-                                 interpolation=cv2.INTER_CUBIC)
-
         # CLAHE on luminance channel only
         lab = cv2.cvtColor(roi_img, cv2.COLOR_BGR2LAB)
         l_chan, a_chan, b_chan = cv2.split(lab)
@@ -2084,7 +2074,7 @@ class TextDetector:
         sharpened = cv2.addWeighted(denoised, 1.5, blurred, -0.5, 0)
 
         gray = cv2.cvtColor(sharpened, cv2.COLOR_BGR2GRAY)
-        return sharpened, gray, scale
+        return sharpened, gray
 
     def _apply_corrections(self, texts):
         """Apply name corrections (exact dict + auto-learned) to OCR results.
@@ -2296,7 +2286,7 @@ class TextDetector:
             print("[+] EasyOCR: ready.", file=sys.stderr)
 
         # Preprocess for better accuracy
-        enhanced, _, scale = self._preprocess_roi(roi_img)
+        enhanced, _ = self._preprocess_roi(roi_img)
 
         # EasyOCR expects RGB
         rgb = cv2.cvtColor(enhanced, cv2.COLOR_BGR2RGB)
@@ -2313,11 +2303,9 @@ class TextDetector:
             y = min(ys)
             w = max(xs) - x
             h = max(ys) - y
-            # Scale coordinates back to original size
             results.append({
                 "text": text,
-                "bbox": (offset_x + x // scale, offset_y + y // scale,
-                         w // scale, h // scale),
+                "bbox": (offset_x + x, offset_y + y, w, h),
                 "confidence": float(conf),
             })
         return results
@@ -2379,8 +2367,7 @@ class TextDetector:
 
     def _detect_tesseract(self, roi_img, gray, offset_x, offset_y):
         """Detect and recognize text using Tesseract OCR with enhanced preprocessing."""
-        # Use the shared preprocessing pipeline (CLAHE + denoise + sharpen + upscale)
-        _, enhanced_gray, scale = self._preprocess_roi(roi_img)
+        _, enhanced_gray = self._preprocess_roi(roi_img)
 
         # Adaptive threshold handles varying background better than global Otsu
         thresh = cv2.adaptiveThreshold(enhanced_gray, 255,
@@ -2401,11 +2388,10 @@ class TextDetector:
             text = data["text"][i].strip()
             conf = int(data["conf"][i])
             if text and conf > 0:
-                # Scale bounding boxes back to original coordinates
-                x = int(data["left"][i] / scale)
-                y = int(data["top"][i] / scale)
-                w = int(data["width"][i] / scale)
-                h = int(data["height"][i] / scale)
+                x = int(data["left"][i])
+                y = int(data["top"][i])
+                w = int(data["width"][i])
+                h = int(data["height"][i])
                 results.append({
                     "text": text,
                     "bbox": (offset_x + x, offset_y + y, w, h),
