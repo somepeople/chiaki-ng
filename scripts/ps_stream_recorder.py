@@ -1354,11 +1354,17 @@ class StreamOutput:
             elif self.hw_decoder == "vdpau":
                 cmd = ["ffmpeg", "-y"] + base_flags + [
                        "-hwaccel", "vdpau",
-                       "-f", codec_name, "-i", "pipe:0"]
+                       "-f", codec_name, "-i", "pipe:0",
+                       "-vf", "format=yuv420p"]
             else:
                 cmd = ["ffmpeg", "-y"] + base_flags + [
                        "-hwaccel", self.hw_decoder,
-                       "-f", codec_name, "-i", "pipe:0"]
+                       "-f", codec_name, "-i", "pipe:0",
+                       "-vf", "format=yuv420p"]
+        else:
+            # Software decode: explicit format filter so FFmpeg can negotiate
+            # with v4l2loopback (which may not support the decoder's native fmt)
+            cmd.extend(["-vf", "format=yuv420p"])
 
         cmd.extend([
             "-f", "v4l2",
