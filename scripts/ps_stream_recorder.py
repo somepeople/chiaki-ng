@@ -1237,6 +1237,13 @@ try:
 except ImportError:
     pass
 
+_av_available = False
+try:
+    import av
+    _av_available = True
+except ImportError:
+    pass
+
 
 class TextDetector:
     """
@@ -1401,45 +1408,18 @@ class TextDetector:
                   f"from {template_dir}", file=sys.stderr)
 
     def start(self):
-        """Start the FFmpeg decoder subprocess and detection thread."""
-        codec_name = "h264" if self.codec == "h264" else "hevc"
+        """Start the decoder and detection thread.
 
-        cmd = ["ffmpeg", "-hide_banner", "-loglevel", "warning"]
-        if self.hw_decoder:
-            cmd += ["-hwaccel", self.hw_decoder]
-        # Use generous probesize so FFmpeg can find SPS/PPS and start decoding.
-        # The low_delay flags reduce buffering once decoding has started.
-        cmd += ["-probesize", "5000000", "-analyzeduration", "2000000"]
-        cmd += ["-f", codec_name, "-i", "pipe:0"]
-
-        # Output raw BGR24 frames to stdout
-        cmd += ["-f", "rawvideo", "-pix_fmt", "bgr24", "-an",
-                "-vsync", "drop", "pipe:1"]
-
-        print(f"  [ocr] FFmpeg cmd: {' '.join(cmd)}", file=sys.stderr)
-
-        self._ffmpeg_proc = subprocess.Popen(
-            cmd,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=None,  # show FFmpeg errors/warnings on terminal
-            bufsize=self.width * self.height * 3 * 2,  # buffer ~2 frames
-        )
-
+        Uses PyAV (in-process libavcodec) when available for zero-copy
+        decoding.  Falls back to a FFmpeg subprocess with pipe I/O.
+        """
         self._stop_event.clear()
+        self._use_pyav = False
 
-        # Writer thread: pipes buffered H.264 data to FFmpeg without blocking
-        self._writer_thread = threading.Thread(
-            target=self._writer_loop, daemon=True, name="TextDetector-Writer"
-        )
-        self._writer_thread.start()
-
-        # Reader thread: reads decoded frames as fast as possible,
-        # keeps only the latest frame to avoid lag.
-        self._reader_thread = threading.Thread(
-            target=self._reader_loop, daemon=True, name="FrameReader"
-        )
-        self._reader_thread.start()
+        if _av_available:
+            self._start_pyav()
+        else:
+            self._start_ffmpeg()
 
         # Detection thread: picks up the latest frame and runs OCR
         self._decoder_thread = threading.Thread(
@@ -1450,6 +1430,54 @@ class TextDetector:
               f"skip={self.skip_frames}, "
               f"mode={'template' if self._templates else 'MSER'})",
               file=sys.stderr)
+
+    # ---- PyAV (in-process) decoder path ----
+
+    def _start_pyav(self):
+        """Initialize an in-process H.264/H.265 decoder using PyAV."""
+        codec_name = "h264" if self.codec == "h264" else "hevc"
+        self._av_codec_ctx = av.codec.CodecContext.create(codec_name, "r")
+        # Low-latency: decode as soon as a full frame arrives
+        self._av_codec_ctx.thread_type = "FRAME"
+        self._av_codec_ctx.options = {"flags": "low_delay", "flags2": "fast"}
+        self._use_pyav = True
+        self._pyav_frame_idx = 0
+        print(f"  [ocr] Using PyAV in-process decoder ({codec_name})",
+              file=sys.stderr)
+
+    def _start_ffmpeg(self):
+        """Fallback: launch an FFmpeg subprocess with pipe I/O."""
+        codec_name = "h264" if self.codec == "h264" else "hevc"
+
+        cmd = ["ffmpeg", "-hide_banner", "-loglevel", "warning"]
+        if self.hw_decoder:
+            cmd += ["-hwaccel", self.hw_decoder]
+        cmd += ["-probesize", "5000000", "-analyzeduration", "2000000"]
+        cmd += ["-f", codec_name, "-i", "pipe:0"]
+        cmd += ["-f", "rawvideo", "-pix_fmt", "bgr24", "-an",
+                "-vsync", "drop", "pipe:1"]
+
+        print(f"  [ocr] FFmpeg cmd: {' '.join(cmd)}", file=sys.stderr)
+
+        self._ffmpeg_proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=None,
+            bufsize=self.width * self.height * 3 * 2,
+        )
+
+        # Writer thread: pipes buffered H.264 data to FFmpeg without blocking
+        self._writer_thread = threading.Thread(
+            target=self._writer_loop, daemon=True, name="TextDetector-Writer"
+        )
+        self._writer_thread.start()
+
+        # Reader thread: reads decoded frames as fast as possible
+        self._reader_thread = threading.Thread(
+            target=self._reader_loop, daemon=True, name="FrameReader"
+        )
+        self._reader_thread.start()
 
     def stop(self):
         """Stop the detector and clean up."""
@@ -1470,6 +1498,9 @@ class TextDetector:
             except Exception:
                 self._ffmpeg_proc.kill()
             self._ffmpeg_proc = None
+        if hasattr(self, '_av_codec_ctx') and self._av_codec_ctx:
+            self._av_codec_ctx.close()
+            self._av_codec_ctx = None
         if self._reader_thread:
             self._reader_thread.join(timeout=3)
             self._reader_thread = None
@@ -1485,20 +1516,56 @@ class TextDetector:
     def feed(self, h264_data):
         """Feed raw H.264/H.265 data to the decoder. Truly non-blocking.
 
-        Drops data if the writer thread hasn't consumed the previous chunk yet.
-        This prevents backpressure from blocking the video callback.
+        When using PyAV, decodes in-place and stores the latest frame.
+        When using FFmpeg subprocess, buffers data for the writer thread.
         """
         self._frame_count += 1
         if self._frame_count == 1:
             print(f"  [ocr] First NAL unit fed to decoder ({len(h264_data)} bytes)",
                   file=sys.stderr)
-        # Accumulate data (don't drop partial NAL units, append to buffer)
-        with self._write_lock:
-            if self._write_buf is None:
-                self._write_buf = h264_data
-            else:
-                self._write_buf += h264_data
-        self._write_event.set()
+
+        if self._use_pyav:
+            self._feed_pyav(h264_data)
+        else:
+            # FFmpeg subprocess path: accumulate data for writer thread
+            with self._write_lock:
+                if self._write_buf is None:
+                    self._write_buf = h264_data
+                else:
+                    self._write_buf += h264_data
+            self._write_event.set()
+
+    def _feed_pyav(self, h264_data):
+        """Decode H.264/H.265 data in-process using PyAV (libavcodec).
+
+        Parses NAL units into packets, decodes them, and stores the latest
+        frame as a BGR24 numpy array.  Runs on the caller's thread (the
+        video callback) but the actual heavy work is just a C-level decode
+        call so it's fast — typically <1ms per packet on any modern CPU.
+        """
+        try:
+            packet = av.packet.Packet(h264_data)
+            frames = self._av_codec_ctx.decode(packet)
+        except av.error.InvalidDataError:
+            return  # partial/corrupt NAL, skip
+        except Exception:
+            return
+
+        for video_frame in frames:
+            self._pyav_frame_idx += 1
+            if self._pyav_frame_idx == 1:
+                print(f"  [ocr] First frame decoded!", file=sys.stderr)
+
+            # Skip frames for performance
+            if self._pyav_frame_idx % self.skip_frames != 0:
+                continue
+
+            # Convert to BGR24 numpy array (zero-copy when possible)
+            bgr = video_frame.to_ndarray(format="bgr24")
+
+            with self._frame_lock:
+                self._latest_frame = bgr
+            self._frame_ready.set()
 
     def _writer_loop(self):
         """Background thread: writes buffered H.264 data to FFmpeg stdin.
