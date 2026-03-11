@@ -2267,20 +2267,6 @@ class TextDetector:
                     "fields": {},
                 }
 
-                # Pre-detect "ready" status so we can adjust
-                # gamertag crop coordinates when READY is displayed.
-                player_is_ready = False
-                for fn, fb in player.get("fields", {}).items():
-                    if fb.get("type") == "ready":
-                        rx = max(0, min(fb["x"], pw - 1))
-                        ry = max(0, min(fb["y"], ph - 1))
-                        rw = min(fb["width"], pw - rx)
-                        rh = min(fb["height"], ph - ry)
-                        ready_roi = player_roi[ry:ry + rh, rx:rx + rw]
-                        if ready_roi.size > 0:
-                            player_is_ready = self._detect_ready_color(ready_roi)
-                        break
-
                 # OCR each sub-field at its relative position
                 for field_name, fbox in player.get("fields", {}).items():
                     fx, fy = fbox["x"], fbox["y"]
@@ -2301,26 +2287,27 @@ class TextDetector:
 
                     # "ready" fields use color detection instead of OCR
                     if fbox.get("type") == "ready":
+                        is_ready = self._detect_ready_color(field_roi)
                         player_result["fields"][field_name] = {
-                            "text": "READY" if player_is_ready else "",
-                            "confidence": 1.0 if player_is_ready else 0.0,
+                            "text": "READY" if is_ready else "",
+                            "confidence": 1.0 if is_ready else 0.0,
                             "bbox": (abs_x, abs_y, fw, fh),
-                            "ready": player_is_ready,
+                            "ready": is_ready,
                         }
                         continue
 
-                    # When player is READY, shift gamertag x by 58px
-                    # to avoid capturing the "READY" overlay text.
-                    if field_name == "gamertag" and player_is_ready:
-                        shift = 58
-                        fx = fx + shift
-                        fw = fw - shift
-                        if fw <= 0:
-                            continue
-                        field_roi = player_roi[fy:fy + fh, fx:fx + fw]
-                        if field_roi.size == 0:
-                            continue
-                        abs_x = px + fx
+                    # Trim gamertag ROI to the actual text region,
+                    # excluding icons (star, speaker, PS, controller)
+                    # and the green READY overlay.
+                    if field_name == "gamertag":
+                        tx, tw2 = self._trim_gamertag_to_text(field_roi)
+                        if tw2 > 0 and tw2 != fw:
+                            fx = fx + tx
+                            fw = tw2
+                            field_roi = player_roi[fy:fy + fh, fx:fx + fw]
+                            if field_roi.size == 0:
+                                continue
+                            abs_x = px + fx
 
                     # OCR this small field region
                     texts = self._detect_roi(field_roi, abs_x, abs_y)
@@ -2396,6 +2383,80 @@ class TextDetector:
         mask = cv2.inRange(hsv, lower_green, upper_green)
         ratio = float(np.count_nonzero(mask)) / max(mask.size, 1)
         return ratio >= 0.15
+
+    @staticmethod
+    def _trim_gamertag_to_text(roi_img):
+        """Find the bounding box of the actual gamertag text inside a ROI.
+
+        Gamertag ROIs typically contain colored icons (star, speaker,
+        PlayStation logo, controller) alongside white text.  This method
+        isolates near-white pixels, groups connected components that are
+        vertically aligned and letter-sized, and returns the horizontal
+        span of the text cluster.
+
+        Returns:
+            (x_offset, width): horizontal crop coordinates relative to the
+            input ROI.  If detection fails, returns (0, roi_width) so the
+            original ROI is used unchanged.
+        """
+        h, w = roi_img.shape[:2]
+        if h == 0 or w == 0:
+            return 0, w
+
+        # 1. Build a mask of near-white pixels (the gamertag text is white)
+        #    Threshold each channel independently: R>180, G>180, B>180
+        b, g, r = cv2.split(roi_img)
+        white_mask = cv2.bitwise_and(
+            cv2.bitwise_and(
+                cv2.threshold(r, 180, 255, cv2.THRESH_BINARY)[1],
+                cv2.threshold(g, 180, 255, cv2.THRESH_BINARY)[1],
+            ),
+            cv2.threshold(b, 180, 255, cv2.THRESH_BINARY)[1],
+        )
+
+        # 2. Light morphological close to join broken letter strokes
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+        white_mask = cv2.morphologyEx(white_mask, cv2.MORPH_CLOSE, kernel)
+
+        # 3. Connected-component analysis
+        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
+            white_mask, connectivity=8
+        )
+        if num_labels <= 1:
+            return 0, w  # nothing found, keep original
+
+        # 4. Filter components that look like text characters:
+        #    - height between 30% and 100% of ROI height
+        #    - width < 80% of ROI width (full-width blobs are not text)
+        #    - area > 4 px  (ignore tiny noise)
+        min_ch = int(h * 0.3)
+        max_ch = h
+        text_boxes = []  # (x, x+w) per accepted component
+        for i in range(1, num_labels):  # skip background label 0
+            cx = stats[i, cv2.CC_STAT_LEFT]
+            cw = stats[i, cv2.CC_STAT_WIDTH]
+            ch = stats[i, cv2.CC_STAT_HEIGHT]
+            ca = stats[i, cv2.CC_STAT_AREA]
+            if ca <= 4:
+                continue
+            if ch < min_ch or ch > max_ch:
+                continue
+            if cw > w * 0.8:
+                continue
+            text_boxes.append((cx, cx + cw))
+
+        if not text_boxes:
+            return 0, w
+
+        # 5. Take the horizontal span of all accepted components
+        x_min = min(x1 for x1, _ in text_boxes)
+        x_max = max(x2 for _, x2 in text_boxes)
+
+        # Small padding (2px each side) to avoid clipping edges
+        x_min = max(0, x_min - 2)
+        x_max = min(w, x_max + 2)
+
+        return x_min, x_max - x_min
 
     def _draw_lineup_overlay(self, display, lineup_data):
         """Draw contour-only overlay for lineup detection (no text, no fill)."""
