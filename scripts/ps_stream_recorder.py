@@ -1262,6 +1262,8 @@ class TextDetector:
                  skip_frames=5,
                  min_confidence=0.7,
                  hw_decoder=None,
+                 show_window=False,
+                 window_scale=1.0,
                  verbose=False):
         """
         Args:
@@ -1276,6 +1278,8 @@ class TextDetector:
             skip_frames: Process every N-th frame (default 5 = ~12fps at 60fps input).
             min_confidence: Minimum confidence for template matching (0-1).
             hw_decoder: FFmpeg HW decoder name (e.g. "vaapi", "nvdec").
+            show_window: Show a debug window with overlaid detections (cv2.imshow).
+            window_scale: Scale factor for the debug window (e.g. 0.5 = half size).
             verbose: Print debug info.
         """
         if not _cv2_available:
@@ -1293,6 +1297,8 @@ class TextDetector:
         self.skip_frames = max(1, skip_frames)
         self.min_confidence = min_confidence
         self.hw_decoder = hw_decoder
+        self.show_window = show_window
+        self.window_scale = window_scale
         self.verbose = verbose
 
         self._ffmpeg_proc = None
@@ -1402,6 +1408,8 @@ class TextDetector:
         if self._decoder_thread:
             self._decoder_thread.join(timeout=3)
             self._decoder_thread = None
+        if self.show_window:
+            cv2.destroyAllWindows()
         if self._detect_count > 0:
             print(f"[+] TextDetector stopped: processed {self._detect_count} frames",
                   file=sys.stderr)
@@ -1503,6 +1511,49 @@ class TextDetector:
                     self.on_text_detected(all_texts, frame)
                 except Exception as e:
                     print(f"[!] TextDetector callback error: {e}", file=sys.stderr)
+
+            # Debug window: show frame with overlaid detections
+            if self.show_window:
+                display = frame.copy()
+                # Draw ROI rectangles (blue dashed)
+                for roi in self.rois:
+                    rx = int(roi[0] * self.width)
+                    ry = int(roi[1] * self.height)
+                    rw = int(roi[2] * self.width)
+                    rh = int(roi[3] * self.height)
+                    cv2.rectangle(display, (rx, ry), (rx + rw, ry + rh),
+                                  (255, 150, 0), 1)
+                # Draw detections
+                for t in all_texts:
+                    bx, by, bw, bh = t["bbox"]
+                    conf = t["confidence"]
+                    # Green box for detections
+                    cv2.rectangle(display, (bx, by), (bx + bw, by + bh),
+                                  (0, 255, 0), 2)
+                    # Label with text and confidence
+                    label = f"{t['text']} {conf:.0%}"
+                    # Background rectangle for readability
+                    (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX,
+                                                   0.5, 1)
+                    cv2.rectangle(display, (bx, by - th - 6), (bx + tw + 4, by),
+                                  (0, 0, 0), -1)
+                    cv2.putText(display, label, (bx + 2, by - 4),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+                # FPS / stats overlay
+                stats = f"Frame #{self._detect_count} | {len(all_texts)} detections"
+                cv2.putText(display, stats, (10, display.shape[0] - 10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 1)
+                # Scale down if requested
+                if self.window_scale != 1.0:
+                    new_w = int(display.shape[1] * self.window_scale)
+                    new_h = int(display.shape[0] * self.window_scale)
+                    display = cv2.resize(display, (new_w, new_h))
+                cv2.imshow("PS Stream - Text Detection", display)
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord('q'):
+                    print("  [ocr] 'q' pressed, stopping...", file=sys.stderr)
+                    self._stop_event.set()
+                    break
 
             if self.verbose and self._detect_count % 60 == 0:
                 print(f"  [ocr] {self._detect_count} frames processed, "
@@ -1676,7 +1727,9 @@ class StreamOutput:
                  text_rois=None,
                  text_template_dir=None,
                  text_skip_frames=5,
-                 text_min_confidence=0.7):
+                 text_min_confidence=0.7,
+                 show_debug_window=False,
+                 debug_window_scale=0.5):
         self.host = host
         self.regist_key = regist_key
         self.morning = morning
@@ -1703,6 +1756,8 @@ class StreamOutput:
         self.text_template_dir = text_template_dir
         self.text_skip_frames = text_skip_frames
         self.text_min_confidence = text_min_confidence
+        self.show_debug_window = show_debug_window
+        self.debug_window_scale = debug_window_scale
         self._text_detector = None
 
         self._lib = load_libchiaki(lib_path)
@@ -1993,6 +2048,8 @@ class StreamOutput:
                 skip_frames=self.text_skip_frames,
                 min_confidence=self.text_min_confidence,
                 hw_decoder=self.hw_decoder,
+                show_window=self.show_debug_window,
+                window_scale=self.debug_window_scale,
                 verbose=self.verbose,
             )
             self._text_detector.start()
@@ -2574,6 +2631,10 @@ Examples:
                                help="Process every N-th frame for text detection (default: 5)")
     stream_parser.add_argument("--text-confidence", type=float, default=0.7,
                                help="Minimum confidence for text detection (0-1, default: 0.7)")
+    stream_parser.add_argument("--debug-window", action="store_true",
+                               help="Show OpenCV debug window with video and detection overlays (press 'q' to quit)")
+    stream_parser.add_argument("--debug-scale", type=float, default=0.5,
+                               help="Scale factor for debug window (default: 0.5 = half size)")
 
     args = parser.parse_args()
 
@@ -2803,11 +2864,13 @@ Examples:
             v4l2_device=args.v4l2, hw_decoder=args.hw_decoder,
             controller_device=args.controller,
             play=args.play,
-            detect_text=args.detect_text,
+            detect_text=args.detect_text or args.debug_window,
             text_rois=text_rois,
             text_template_dir=args.text_templates,
             text_skip_frames=args.text_skip,
             text_min_confidence=args.text_confidence,
+            show_debug_window=args.debug_window,
+            debug_window_scale=args.debug_scale,
         )
         streamer.stream()
 
