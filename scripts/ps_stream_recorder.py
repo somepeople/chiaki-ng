@@ -1796,9 +1796,9 @@ class TextDetector:
                 except Exception as e:
                     print(f"[!] TextDetector callback error: {e}", file=sys.stderr)
 
-            # Debug window: show contours only on black background
+            # Debug window: show frame with contours only (no labels)
             if self.show_window:
-                display = np.zeros_like(frame)
+                display = frame.copy()
 
                 # Draw lineup overlay (red player frames + fields)
                 if lineup_data is not None:
