@@ -1888,8 +1888,10 @@ class TextDetector:
 
         For each player frame:
           - Extracts the player card region from the full frame
-          - OCRs each sub-field (position, name, height, weight, perks)
+          - OCRs each sub-field (position, name, gamertag, height, weight, perks)
             at its configured relative offset within the player card
+          - For fields with "type": "ready", uses green-color detection
+            instead of OCR and returns a boolean "ready" flag
           - Returns structured results per team/player
 
         Returns:
@@ -1904,6 +1906,8 @@ class TextDetector:
                                 "fields": {
                                     "position": {"text": "C", "confidence": 0.95, "bbox": (...)},
                                     "name": {"text": "GRETZKY", ...},
+                                    "gamertag": {"text": "xPlayer99", ...},
+                                    "ready": {"text": "READY", "ready": True, ...},
                                     ...
                                 }
                             }, ...
@@ -1962,9 +1966,21 @@ class TextDetector:
                     if field_roi.size == 0:
                         continue
 
-                    # OCR this small field region
                     abs_x = px + fx
                     abs_y = py + fy
+
+                    # "ready" fields use color detection instead of OCR
+                    if fbox.get("type") == "ready":
+                        is_ready = self._detect_ready_color(field_roi)
+                        player_result["fields"][field_name] = {
+                            "text": "READY" if is_ready else "",
+                            "confidence": 1.0 if is_ready else 0.0,
+                            "bbox": (abs_x, abs_y, fw, fh),
+                            "ready": is_ready,
+                        }
+                        continue
+
+                    # OCR this small field region
                     texts = self._detect_roi(field_roi, abs_x, abs_y)
 
                     if texts:
@@ -1986,6 +2002,21 @@ class TextDetector:
             result["teams"][team_key] = team_result
 
         return result
+
+    @staticmethod
+    def _detect_ready_color(roi_img):
+        """Detect whether a ROI contains a green "READY" indicator.
+
+        Converts the ROI to HSV and checks if enough pixels fall in the
+        green hue range (H 35-85, S > 50, V > 50).  Returns True when
+        at least 15% of the ROI area is green.
+        """
+        hsv = cv2.cvtColor(roi_img, cv2.COLOR_BGR2HSV)
+        lower_green = np.array([35, 50, 50])
+        upper_green = np.array([85, 255, 255])
+        mask = cv2.inRange(hsv, lower_green, upper_green)
+        ratio = float(np.count_nonzero(mask)) / max(mask.size, 1)
+        return ratio >= 0.15
 
     def _draw_lineup_overlay(self, display, lineup_data):
         """Draw red overlay rectangles and OCR results for lineup detection.
@@ -2029,25 +2060,39 @@ class TextDetector:
                     fx, fy, fw, fh = field_data["bbox"]
                     text = field_data["text"]
                     conf = field_data["confidence"]
+                    is_ready_field = "ready" in field_data
 
-                    # Thin red rectangle around the field
-                    cv2.rectangle(display, (fx, fy), (fx + fw, fy + fh),
-                                  (0, 0, 255), 1)
-
-                    # Field label (top-left, small)
-                    label_color = (100, 100, 255)  # light red
-                    cv2.putText(display, field_name,
-                                (fx + 2, fy - 2),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.3,
-                                label_color, 1)
-
-                    # Detected text (inside the box)
-                    if text:
-                        display_text = f"{text} {conf:.0%}"
-                        cv2.putText(display, display_text,
+                    if is_ready_field:
+                        # Ready field: green border + fill when ready,
+                        # red border when not ready
+                        is_ready = field_data["ready"]
+                        color = (0, 200, 0) if is_ready else (0, 0, 200)
+                        cv2.rectangle(display, (fx, fy), (fx + fw, fy + fh),
+                                      color, 2)
+                        label = "READY" if is_ready else "NOT READY"
+                        cv2.putText(display, label,
                                     (fx + 2, fy + fh - 4),
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.4,
-                                    (255, 255, 255), 1)
+                                    color, 1)
+                    else:
+                        # Standard field: thin red rectangle
+                        cv2.rectangle(display, (fx, fy), (fx + fw, fy + fh),
+                                      (0, 0, 255), 1)
+
+                        # Field label (top-left, small)
+                        label_color = (100, 100, 255)  # light red
+                        cv2.putText(display, field_name,
+                                    (fx + 2, fy - 2),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.3,
+                                    label_color, 1)
+
+                        # Detected text (inside the box)
+                        if text:
+                            display_text = f"{text} {conf:.0%}"
+                            cv2.putText(display, display_text,
+                                        (fx + 2, fy + fh - 4),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.4,
+                                        (255, 255, 255), 1)
 
     def _preprocess_roi(self, roi_img):
         """Preprocessing pipeline for OCR accuracy.

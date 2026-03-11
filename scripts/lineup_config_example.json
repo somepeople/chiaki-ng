@@ -18,6 +18,8 @@
           "fields": {
             "position": { "x": 10, "y": 5,   "width": 180, "height": 25 },
             "name":     { "x": 10, "y": 35,  "width": 180, "height": 25 },
+            "gamertag": { "x": 10, "y": 190, "width": 180, "height": 25 },
+            "ready":    { "x": 10, "y": 220, "width": 180, "height": 25, "type": "ready" },
             "height":   { "x": 10, "y": 65,  "width": 85,  "height": 25 },
             "weight":   { "x": 100, "y": 65, "width": 85,  "height": 25 },
             "perk1":    { "x": 10, "y": 100, "width": 180, "height": 25 },
@@ -33,6 +35,8 @@
           "fields": {
             "position": { "x": 10, "y": 5,   "width": 180, "height": 25 },
             "name":     { "x": 10, "y": 35,  "width": 180, "height": 25 },
+            "gamertag": { "x": 10, "y": 190, "width": 180, "height": 25 },
+            "ready":    { "x": 10, "y": 220, "width": 180, "height": 25, "type": "ready" },
             "height":   { "x": 10, "y": 65,  "width": 85,  "height": 25 },
             "weight":   { "x": 100, "y": 65, "width": 85,  "height": 25 },
             "perk1":    { "x": 10, "y": 100, "width": 180, "height": 25 },
@@ -48,6 +52,8 @@
           "fields": {
             "position": { "x": 10, "y": 5,   "width": 180, "height": 25 },
             "name":     { "x": 10, "y": 35,  "width": 180, "height": 25 },
+            "gamertag": { "x": 10, "y": 190, "width": 180, "height": 25 },
+            "ready":    { "x": 10, "y": 220, "width": 180, "height": 25, "type": "ready" },
             "height":   { "x": 10, "y": 65,  "width": 85,  "height": 25 },
             "weight":   { "x": 100, "y": 65, "width": 85,  "height": 25 },
             "perk1":    { "x": 10, "y": 100, "width": 180, "height": 25 },
@@ -63,6 +69,8 @@
           "fields": {
             "position": { "x": 10, "y": 5,   "width": 180, "height": 25 },
             "name":     { "x": 10, "y": 35,  "width": 180, "height": 25 },
+            "gamertag": { "x": 10, "y": 190, "width": 180, "height": 25 },
+            "ready":    { "x": 10, "y": 220, "width": 180, "height": 25, "type": "ready" },
             "height":   { "x": 10, "y": 65,  "width": 85,  "height": 25 },
             "weight":   { "x": 100, "y": 65, "width": 85,  "height": 25 },
             "perk1":    { "x": 10, "y": 100, "width": 180, "height": 25 },
@@ -83,6 +91,8 @@
           "fields": {
             "position": { "x": 10, "y": 5,   "width": 180, "height": 25 },
             "name":     { "x": 10, "y": 35,  "width": 180, "height": 25 },
+            "gamertag": { "x": 10, "y": 190, "width": 180, "height": 25 },
+            "ready":    { "x": 10, "y": 220, "width": 180, "height": 25, "type": "ready" },
             "height":   { "x": 10, "y": 65,  "width": 85,  "height": 25 },
             "weight":   { "x": 100, "y": 65, "width": 85,  "height": 25 },
             "perk1":    { "x": 10, "y": 100, "width": 180, "height": 25 },
@@ -98,6 +108,8 @@
           "fields": {
             "position": { "x": 10, "y": 5,   "width": 180, "height": 25 },
             "name":     { "x": 10, "y": 35,  "width": 180, "height": 25 },
+            "gamertag": { "x": 10, "y": 190, "width": 180, "height": 25 },
+            "ready":    { "x": 10, "y": 220, "width": 180, "height": 25, "type": "ready" },
             "height":   { "x": 10, "y": 65,  "width": 85,  "height": 25 },
             "weight":   { "x": 100, "y": 65, "width": 85,  "height": 25 },
             "perk1":    { "x": 10, "y": 100, "width": 180, "height": 25 },
@@ -113,6 +125,8 @@
           "fields": {
             "position": { "x": 10, "y": 5,   "width": 180, "height": 25 },
             "name":     { "x": 10, "y": 35,  "width": 180, "height": 25 },
+            "gamertag": { "x": 10, "y": 190, "width": 180, "height": 25 },
+            "ready":    { "x": 10, "y": 220, "width": 180, "height": 25, "type": "ready" },
             "height":   { "x": 10, "y": 65,  "width": 85,  "height": 25 },
             "weight":   { "x": 100, "y": 65, "width": 85,  "height": 25 },
             "perk1":    { "x": 10, "y": 100, "width": 180, "height": 25 },
@@ -128,6 +142,8 @@
           "fields": {
             "position": { "x": 10, "y": 5,   "width": 180, "height": 25 },
             "name":     { "x": 10, "y": 35,  "width": 180, "height": 25 },
+            "gamertag": { "x": 10, "y": 190, "width": 180, "height": 25 },
+            "ready":    { "x": 10, "y": 220, "width": 180, "height": 25, "type": "ready" },
             "height":   { "x": 10, "y": 65,  "width": 85,  "height": 25 },
             "weight":   { "x": 100, "y": 65, "width": 85,  "height": 25 },
             "perk1":    { "x": 10, "y": 100, "width": 180, "height": 25 },
