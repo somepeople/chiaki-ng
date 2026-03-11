@@ -1796,15 +1796,15 @@ class TextDetector:
                 except Exception as e:
                     print(f"[!] TextDetector callback error: {e}", file=sys.stderr)
 
-            # Debug window: show frame with overlaid detections
+            # Debug window: show contours only on black background
             if self.show_window:
-                display = frame.copy()
+                display = np.zeros_like(frame)
 
                 # Draw lineup overlay (red player frames + fields)
                 if lineup_data is not None:
                     self._draw_lineup_overlay(display, lineup_data)
 
-                # Draw ROI rectangles (blue)
+                # Draw ROI rectangles (orange)
                 for roi in self.rois:
                     rx = int(roi[0] * self.width)
                     ry = int(roi[1] * self.height)
@@ -1812,23 +1812,11 @@ class TextDetector:
                     rh = int(roi[3] * self.height)
                     cv2.rectangle(display, (rx, ry), (rx + rw, ry + rh),
                                   (255, 150, 0), 1)
-                # Draw detections
+                # Draw detection contours (green, no labels)
                 for t in all_texts:
                     bx, by, bw, bh = t["bbox"]
-                    conf = t["confidence"]
                     cv2.rectangle(display, (bx, by), (bx + bw, by + bh),
                                   (0, 255, 0), 2)
-                    label = f"{t['text']} {conf:.0%}"
-                    (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX,
-                                                   0.5, 1)
-                    cv2.rectangle(display, (bx, by - th - 6), (bx + tw + 4, by),
-                                  (0, 0, 0), -1)
-                    cv2.putText(display, label, (bx + 2, by - 4),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
-                # Stats overlay
-                stats = f"Frame #{self._detect_count} | {len(all_texts)} det | {self._ocr_engine}"
-                cv2.putText(display, stats, (10, display.shape[0] - 10),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 1)
                 # Scale
                 if self.window_scale != 1.0:
                     new_w = int(display.shape[1] * self.window_scale)
@@ -2040,80 +2028,39 @@ class TextDetector:
         return ratio >= 0.15
 
     def _draw_lineup_overlay(self, display, lineup_data):
-        """Draw red overlay rectangles and OCR results for lineup detection.
-
-        - Player frames: red rectangle (2px border)
-        - Sub-fields: thin red rectangle + detected text label
-        - Mode: yellow rectangle + text
-        """
+        """Draw contour-only overlay for lineup detection (no text, no fill)."""
         cfg = self._lineup_config
 
-        # Draw mode box (yellow)
+        # Draw mode box (yellow contour)
         mode_cfg = cfg.get("mode")
         if mode_cfg:
             mx, my = mode_cfg["x"], mode_cfg["y"]
             mw, mh = mode_cfg["width"], mode_cfg["height"]
             cv2.rectangle(display, (mx, my), (mx + mw, my + mh),
                           (0, 255, 255), 2)
-            mode_text = lineup_data.get("mode") or ""
-            if mode_text:
-                cv2.putText(display, mode_text, (mx + 4, my + mh - 6),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5,
-                            (0, 255, 255), 1)
 
         # Draw teams
         for team_key, team_data in lineup_data.get("teams", {}).items():
             for player in team_data.get("players", []):
                 px, py, pw, ph = player["bbox"]
 
-                # Red semi-transparent overlay on the player card
-                overlay = display[py:py + ph, px:px + pw].copy()
-                red_tint = np.full_like(overlay, (0, 0, 180), dtype=np.uint8)
-                cv2.addWeighted(red_tint, 0.15, overlay, 0.85, 0,
-                                display[py:py + ph, px:px + pw])
-
                 # Red border around player frame
                 cv2.rectangle(display, (px, py), (px + pw, py + ph),
                               (0, 0, 255), 2)
 
-                # Draw each detected field
+                # Draw each field contour
                 for field_name, field_data in player.get("fields", {}).items():
                     fx, fy, fw, fh = field_data["bbox"]
-                    text = field_data["text"]
-                    conf = field_data["confidence"]
                     is_ready_field = "ready" in field_data
 
                     if is_ready_field:
-                        # Ready field: green border + fill when ready,
-                        # red border when not ready
                         is_ready = field_data["ready"]
                         color = (0, 200, 0) if is_ready else (0, 0, 200)
                         cv2.rectangle(display, (fx, fy), (fx + fw, fy + fh),
                                       color, 2)
-                        label = "READY" if is_ready else "NOT READY"
-                        cv2.putText(display, label,
-                                    (fx + 2, fy + fh - 4),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.4,
-                                    color, 1)
                     else:
-                        # Standard field: thin red rectangle
                         cv2.rectangle(display, (fx, fy), (fx + fw, fy + fh),
                                       (0, 0, 255), 1)
-
-                        # Field label (top-left, small)
-                        label_color = (100, 100, 255)  # light red
-                        cv2.putText(display, field_name,
-                                    (fx + 2, fy - 2),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.3,
-                                    label_color, 1)
-
-                        # Detected text (inside the box)
-                        if text:
-                            display_text = f"{text} {conf:.0%}"
-                            cv2.putText(display, display_text,
-                                        (fx + 2, fy + fh - 4),
-                                        cv2.FONT_HERSHEY_SIMPLEX, 0.4,
-                                        (255, 255, 255), 1)
 
     def _preprocess_roi(self, roi_img):
         """Preprocessing pipeline for OCR accuracy.
