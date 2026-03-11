@@ -1798,6 +1798,10 @@ class TextDetector:
 
             self._detect_count += 1
 
+            # Print structured lineup JSON to stderr
+            if lineup_data is not None:
+                self._print_lineup_json(lineup_data)
+
             if self.on_text_detected:
                 try:
                     self.on_text_detected(all_texts, frame)
@@ -2038,6 +2042,30 @@ class TextDetector:
             result["teams"][team_key] = team_result
 
         return result
+
+    @staticmethod
+    @staticmethod
+    def _print_lineup_json(lineup_data):
+        """Print structured lineup data as JSON to stderr."""
+        output = {"mode": lineup_data.get("mode"), "teams": {}}
+        for team_key, team_data in lineup_data.get("teams", {}).items():
+            team_out = {
+                "name": team_data.get("name") or team_data.get("label", team_key),
+                "players": [],
+            }
+            for player in team_data.get("players", []):
+                fields = player.get("fields", {})
+                player_out = {}
+                for fname, fdata in fields.items():
+                    if fname == "ready":
+                        player_out["ready"] = fdata.get("ready", False)
+                    else:
+                        player_out[fname] = fdata.get("text", "")
+                if "ready" not in player_out:
+                    player_out["ready"] = False
+                team_out["players"].append(player_out)
+            output["teams"][team_key] = team_out
+        print(json.dumps(output, ensure_ascii=False), file=sys.stderr)
 
     @staticmethod
     def _detect_ready_color(roi_img):
@@ -3047,8 +3075,11 @@ class StreamOutput:
 
     @staticmethod
     def _default_text_callback(texts, frame):
-        """Default callback: print detected text to stderr."""
+        """Default callback: print detected text to stderr (non-lineup only)."""
         for t in texts:
+            # Skip lineup-flattened texts (already printed as JSON)
+            if "field" in t:
+                continue
             x, y, w, h = t["bbox"]
             print(f"  [text] \"{t['text']}\" at ({x},{y} {w}x{h}) "
                   f"conf={t['confidence']:.2f}", file=sys.stderr)
