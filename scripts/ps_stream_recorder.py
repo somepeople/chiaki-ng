@@ -1223,6 +1223,13 @@ try:
 except ImportError:
     pass
 
+_tesseract_available = False
+try:
+    import pytesseract
+    _tesseract_available = True
+except ImportError:
+    pass
+
 
 class TextDetector:
     """
@@ -1636,8 +1643,14 @@ class TextDetector:
         return results
 
     def _detect_mser(self, roi_img, offset_x, offset_y):
-        """Detect text regions using MSER (no templates needed)."""
+        """Detect text regions using MSER, with Tesseract OCR when available."""
         gray = cv2.cvtColor(roi_img, cv2.COLOR_BGR2GRAY)
+
+        # If Tesseract is available, use it directly on the ROI for real OCR
+        if _tesseract_available:
+            return self._detect_tesseract(roi_img, gray, offset_x, offset_y)
+
+        # Fallback: MSER region detection only (cannot identify characters)
         regions, _ = self._mser.detectRegions(gray)
         results = []
 
@@ -1661,6 +1674,31 @@ class TextDetector:
         if results:
             results = self._merge_overlapping(results)
 
+        return results
+
+    def _detect_tesseract(self, roi_img, gray, offset_x, offset_y):
+        """Detect and recognize text using Tesseract OCR."""
+        # Preprocess: threshold to improve OCR accuracy
+        _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+        # Use pytesseract to get bounding boxes and text
+        data = pytesseract.image_to_data(thresh, output_type=pytesseract.Output.DICT,
+                                          config="--psm 6")
+        results = []
+        n = len(data["text"])
+        for i in range(n):
+            text = data["text"][i].strip()
+            conf = int(data["conf"][i])
+            if text and conf > 0:
+                x = data["left"][i]
+                y = data["top"][i]
+                w = data["width"][i]
+                h = data["height"][i]
+                results.append({
+                    "text": text,
+                    "bbox": (offset_x + x, offset_y + y, w, h),
+                    "confidence": conf / 100.0,
+                })
         return results
 
     @staticmethod
@@ -2676,6 +2714,10 @@ Examples:
     stream_parser.add_argument("--text-roi", metavar="X,Y,W,H", action="append",
                                help="ROI for text detection as normalized fractions (e.g. 0.0,0.0,1.0,0.15 = top 15%%). "
                                     "Can be specified multiple times. Default: full frame.")
+    stream_parser.add_argument("--text-roi-px", metavar="X1,Y1,X2,Y2", action="append",
+                               help="ROI for text detection as absolute pixel coordinates (e.g. 100,130,260,148). "
+                                    "Automatically converted to normalized fractions using stream resolution. "
+                                    "Can be specified multiple times.")
     stream_parser.add_argument("--text-skip", type=int, default=5,
                                help="Process every N-th frame for text detection (default: 5)")
     stream_parser.add_argument("--text-confidence", type=float, default=0.7,
@@ -2902,6 +2944,25 @@ Examples:
                     print(f"[!] Invalid --text-roi: {roi_str} (expected X,Y,W,H)", file=sys.stderr)
                     sys.exit(1)
                 text_rois.append(tuple(parts))
+
+        # Parse pixel-based ROIs and convert to normalized fractions
+        if hasattr(args, 'text_roi_px') and args.text_roi_px:
+            if text_rois is None:
+                text_rois = []
+            for roi_str in args.text_roi_px:
+                parts = [int(x.strip()) for x in roi_str.split(",")]
+                if len(parts) != 4:
+                    print(f"[!] Invalid --text-roi-px: {roi_str} (expected X1,Y1,X2,Y2)", file=sys.stderr)
+                    sys.exit(1)
+                x1, y1, x2, y2 = parts
+                x_frac = x1 / width
+                y_frac = y1 / height
+                w_frac = (x2 - x1) / width
+                h_frac = (y2 - y1) / height
+                print(f"[+] --text-roi-px {x1},{y1},{x2},{y2} -> normalized "
+                      f"{x_frac:.4f},{y_frac:.4f},{w_frac:.4f},{h_frac:.4f} "
+                      f"(at {width}x{height})", file=sys.stderr)
+                text_rois.append((x_frac, y_frac, w_frac, h_frac))
 
         streamer = StreamOutput(
             host=host, regist_key=regist_key, morning=morning,
