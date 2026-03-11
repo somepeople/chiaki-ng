@@ -2309,10 +2309,10 @@ class TextDetector:
                         }
                         continue
 
-                    # When player is READY, shift gamertag x by 58px
+                    # When player is READY, shift gamertag x by 70px
                     # to avoid capturing the "READY" overlay text.
                     if field_name == "gamertag" and player_is_ready:
-                        shift = 58
+                        shift = 70
                         fx = fx + shift
                         fw = fw - shift
                         if fw <= 0:
