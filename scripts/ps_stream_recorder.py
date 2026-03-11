@@ -2281,35 +2281,63 @@ class TextDetector:
                             player_is_ready = self._detect_ready_color(ready_roi)
                         break
 
-                # Pre-detect "ia" field to identify AI players.
-                # AI players (ia == "IA") are skipped for OCR/crops.
-                player_is_ia = False
-                ia_fbox = player.get("fields", {}).get("ia")
-                if ia_fbox:
-                    ix = max(0, min(ia_fbox["x"], pw - 1))
-                    iy = max(0, min(ia_fbox["y"], ph - 1))
-                    iw = min(ia_fbox["width"], pw - ix)
-                    ih = min(ia_fbox["height"], ph - iy)
-                    ia_roi = player_roi[iy:iy + ih, ix:ix + iw]
-                    if ia_roi.size > 0:
-                        ia_texts = self._detect_roi(ia_roi, px + ix, py + iy)
-                        if ia_texts:
-                            ia_best = max(ia_texts,
-                                          key=lambda t: t["confidence"])
-                            ia_text = ia_best["text"].strip().upper()
-                            player_is_ia = (ia_text == "IA")
-                    player_result["fields"]["ia"] = {
-                        "text": "IA" if player_is_ia else "",
-                        "confidence": 1.0 if player_is_ia else 0.0,
-                        "bbox": (px + ix, py + iy, iw, ih),
+                # Pre-detect key fields (ia, niveau, gamertag) to decide
+                # whether this player slot is inactive (IA or empty).
+                # Inactive players get a white overlay and no crop capture.
+                pre_detect_fields = ("ia", "niveau", "gamertag")
+                pre_results = {}
+                for pdf_name in pre_detect_fields:
+                    pdf_fbox = player.get("fields", {}).get(pdf_name)
+                    if not pdf_fbox:
+                        continue
+                    pfx = max(0, min(pdf_fbox["x"], pw - 1))
+                    pfy = max(0, min(pdf_fbox["y"], ph - 1))
+                    pfw = min(pdf_fbox["width"], pw - pfx)
+                    pfh = min(pdf_fbox["height"], ph - pfy)
+                    pdf_roi = player_roi[pfy:pfy + pfh, pfx:pfx + pfw]
+                    if pdf_roi.size == 0:
+                        continue
+                    pdf_texts = self._detect_roi(
+                        pdf_roi, px + pfx, py + pfy)
+                    detected = ""
+                    conf = 0.0
+                    if pdf_texts:
+                        pdf_best = max(pdf_texts,
+                                       key=lambda t: t["confidence"])
+                        detected = pdf_best["text"].strip()
+                        conf = pdf_best["confidence"]
+                        # Apply known-value correction
+                        known = self.KNOWN_VALUES.get(pdf_name)
+                        if known:
+                            detected = self._fuzzy_match_known(
+                                detected, known)
+                    pre_results[pdf_name] = {
+                        "text": detected,
+                        "confidence": conf,
+                        "bbox": (px + pfx, py + pfy, pfw, pfh),
                     }
 
-                player_result["is_ia"] = player_is_ia
+                ia_text = pre_results.get("ia", {}).get("text", "")
+                niveau_text = pre_results.get("niveau", {}).get("text", "")
+                gamertag_text = pre_results.get(
+                    "gamertag", {}).get("text", "")
 
-                # AI players: skip OCR and crop capture for all fields
-                if player_is_ia:
+                # Player is inactive when ia == "IA" OR both niveau
+                # and gamertag are empty (unoccupied slot).
+                player_is_inactive = (
+                    ia_text.upper() == "IA"
+                    or (not niveau_text and not gamertag_text)
+                )
+                player_result["is_ia"] = player_is_inactive
+
+                # Store pre-detected field results
+                for pdf_name, pdf_data in pre_results.items():
+                    player_result["fields"][pdf_name] = pdf_data
+
+                # Inactive players: white overlay, skip OCR/crops
+                if player_is_inactive:
                     for field_name, fbox in player.get("fields", {}).items():
-                        if field_name == "ia":
+                        if field_name in pre_detect_fields:
                             continue
                         fx = max(0, min(fbox["x"], pw - 1))
                         fy = max(0, min(fbox["y"], ph - 1))
@@ -2325,7 +2353,7 @@ class TextDetector:
 
                 # OCR each sub-field at its relative position
                 for field_name, fbox in player.get("fields", {}).items():
-                    if field_name == "ia":
+                    if field_name in pre_detect_fields:
                         continue  # already processed above
 
                     fx, fy = fbox["x"], fbox["y"]
