@@ -3,6 +3,8 @@
 .idea
 build
 cmake-build-*
+__pycache__/
+*.pyc
 /build_*
 /build-*
 /debug
