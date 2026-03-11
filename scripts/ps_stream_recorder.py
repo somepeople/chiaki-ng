@@ -1212,6 +1212,383 @@ class StreamRecorder:
 
 
 # ---------------------------------------------------------------------------
+# Real-time text detection on decoded video frames (OpenCV)
+# ---------------------------------------------------------------------------
+
+_cv2_available = False
+try:
+    import cv2
+    import numpy as np
+    _cv2_available = True
+except ImportError:
+    pass
+
+
+class TextDetector:
+    """
+    Detects text (e.g. player names) on decoded video frames in real-time.
+
+    Architecture:
+      1. Receives raw H.264/H.265 NAL units via feed() (from the video callback)
+      2. Pipes them to an FFmpeg subprocess that decodes to raw BGR24
+      3. A background thread reads decoded frames and runs detection
+      4. Only processes the latest available frame (skips if behind)
+      5. Calls on_text_detected(texts, frame) callback with results
+
+    Detection modes:
+      - Template matching: load character images from a directory, fast (~1-2ms)
+      - MSER + contour: no templates needed, detects text regions (~5-10ms)
+
+    Usage:
+        def on_text(texts, frame):
+            for t in texts:
+                print(f"Detected: {t['text']} at {t['bbox']} conf={t['confidence']:.2f}")
+
+        detector = TextDetector(
+            width=1920, height=1080, codec="h264",
+            on_text_detected=on_text,
+            rois=[(0.0, 0.0, 1.0, 0.15)],  # top 15% of screen
+            skip_frames=5,  # process every 5th frame
+        )
+        detector.start()
+        # ... in video callback: detector.feed(h264_data)
+        detector.stop()
+    """
+
+    def __init__(self, width, height, codec="h264",
+                 on_text_detected=None,
+                 rois=None,
+                 template_dir=None,
+                 skip_frames=5,
+                 min_confidence=0.7,
+                 hw_decoder=None,
+                 verbose=False):
+        """
+        Args:
+            width, height: Video resolution.
+            codec: "h264" or "hevc".
+            on_text_detected: Callback(texts, frame). texts is a list of dicts
+                with keys: text, bbox (x,y,w,h), confidence.
+            rois: List of (x_frac, y_frac, w_frac, h_frac) normalized ROIs.
+                  Default: full frame.
+            template_dir: Path to directory with character template images
+                (A.png, B.png, ..., 0.png, ..., 9.png). If None, uses MSER.
+            skip_frames: Process every N-th frame (default 5 = ~12fps at 60fps input).
+            min_confidence: Minimum confidence for template matching (0-1).
+            hw_decoder: FFmpeg HW decoder name (e.g. "vaapi", "nvdec").
+            verbose: Print debug info.
+        """
+        if not _cv2_available:
+            raise RuntimeError(
+                "OpenCV not available. Install with: pip install opencv-python\n"
+                "  or: sudo dnf install python3-opencv"
+            )
+
+        self.width = width
+        self.height = height
+        self.codec = codec
+        self.on_text_detected = on_text_detected
+        self.rois = rois or [(0.0, 0.0, 1.0, 1.0)]
+        self.template_dir = template_dir
+        self.skip_frames = max(1, skip_frames)
+        self.min_confidence = min_confidence
+        self.hw_decoder = hw_decoder
+        self.verbose = verbose
+
+        self._ffmpeg_proc = None
+        self._decoder_thread = None
+        self._stop_event = threading.Event()
+        self._frame_count = 0
+        self._detect_count = 0
+        self._pipe_lock = threading.Lock()
+
+        # Pre-loaded character templates {char: grayscale_image}
+        self._templates = {}
+        if template_dir:
+            self._load_templates(template_dir)
+
+        # MSER detector (fallback when no templates)
+        self._mser = None
+        if not self._templates:
+            self._mser = cv2.MSER_create()
+            # Tune for game text: smaller areas, high contrast
+            self._mser.setMinArea(30)
+            self._mser.setMaxArea(2000)
+            self._mser.setDelta(5)
+
+    def _load_templates(self, template_dir):
+        """Load character template images from a directory."""
+        template_path = Path(template_dir)
+        if not template_path.is_dir():
+            print(f"[!] Template directory not found: {template_dir}", file=sys.stderr)
+            return
+        for img_file in sorted(template_path.glob("*.png")):
+            char = img_file.stem  # e.g. "A" from "A.png"
+            img = cv2.imread(str(img_file), cv2.IMREAD_GRAYSCALE)
+            if img is not None:
+                self._templates[char] = img
+        if self._templates:
+            print(f"[+] TextDetector: loaded {len(self._templates)} character templates "
+                  f"from {template_dir}", file=sys.stderr)
+
+    def start(self):
+        """Start the FFmpeg decoder subprocess and detection thread."""
+        codec_name = "h264" if self.codec == "h264" else "hevc"
+
+        cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error"]
+        cmd += ["-fflags", "nobuffer", "-flags", "low_delay"]
+        cmd += ["-f", codec_name, "-i", "pipe:0"]
+
+        if self.hw_decoder:
+            cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error"]
+            cmd += ["-hwaccel", self.hw_decoder]
+            cmd += ["-fflags", "nobuffer", "-flags", "low_delay"]
+            cmd += ["-f", codec_name, "-i", "pipe:0"]
+
+        # Output raw BGR24 frames to stdout
+        cmd += ["-f", "rawvideo", "-pix_fmt", "bgr24", "-an",
+                "-vsync", "drop", "pipe:1"]
+
+        if self.verbose:
+            print(f"[+] TextDetector FFmpeg: {' '.join(cmd)}", file=sys.stderr)
+
+        self._ffmpeg_proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL if not self.verbose else None,
+            bufsize=self.width * self.height * 3 * 2,  # buffer ~2 frames
+        )
+
+        self._stop_event.clear()
+        self._decoder_thread = threading.Thread(
+            target=self._detection_loop, daemon=True, name="TextDetector"
+        )
+        self._decoder_thread.start()
+        print(f"[+] TextDetector started ({self.width}x{self.height}, "
+              f"skip={self.skip_frames}, "
+              f"mode={'template' if self._templates else 'MSER'})",
+              file=sys.stderr)
+
+    def stop(self):
+        """Stop the detector and clean up."""
+        self._stop_event.set()
+        if self._ffmpeg_proc:
+            try:
+                self._ffmpeg_proc.stdin.close()
+            except Exception:
+                pass
+            try:
+                self._ffmpeg_proc.terminate()
+                self._ffmpeg_proc.wait(timeout=3)
+            except Exception:
+                self._ffmpeg_proc.kill()
+            self._ffmpeg_proc = None
+        if self._decoder_thread:
+            self._decoder_thread.join(timeout=3)
+            self._decoder_thread = None
+        if self._detect_count > 0:
+            print(f"[+] TextDetector stopped: processed {self._detect_count} frames",
+                  file=sys.stderr)
+
+    def feed(self, h264_data):
+        """Feed raw H.264/H.265 data to the decoder. Non-blocking."""
+        if self._ffmpeg_proc and self._ffmpeg_proc.stdin:
+            with self._pipe_lock:
+                try:
+                    self._ffmpeg_proc.stdin.write(h264_data)
+                    self._ffmpeg_proc.stdin.flush()
+                except (BrokenPipeError, OSError):
+                    pass
+
+    def _detection_loop(self):
+        """Background thread: read decoded frames and run text detection."""
+        frame_size = self.width * self.height * 3  # BGR24
+        stdout = self._ffmpeg_proc.stdout
+        frame_idx = 0
+
+        while not self._stop_event.is_set():
+            # Read one full frame
+            try:
+                raw = stdout.read(frame_size)
+            except Exception:
+                break
+            if len(raw) != frame_size:
+                break  # EOF or error
+
+            frame_idx += 1
+            # Skip frames for performance
+            if frame_idx % self.skip_frames != 0:
+                continue
+
+            # Convert to numpy array
+            frame = np.frombuffer(raw, dtype=np.uint8).reshape(
+                (self.height, self.width, 3)
+            )
+
+            # Run detection on each ROI
+            all_texts = []
+            for roi in self.rois:
+                x = int(roi[0] * self.width)
+                y = int(roi[1] * self.height)
+                w = int(roi[2] * self.width)
+                h = int(roi[3] * self.height)
+                roi_img = frame[y:y+h, x:x+w]
+
+                if self._templates:
+                    texts = self._detect_template(roi_img, x, y)
+                else:
+                    texts = self._detect_mser(roi_img, x, y)
+                all_texts.extend(texts)
+
+            self._detect_count += 1
+
+            if all_texts and self.on_text_detected:
+                try:
+                    self.on_text_detected(all_texts, frame)
+                except Exception as e:
+                    print(f"[!] TextDetector callback error: {e}", file=sys.stderr)
+
+            if self.verbose and self._detect_count % 60 == 0:
+                print(f"  [ocr] {self._detect_count} frames processed, "
+                      f"last: {len(all_texts)} detections", file=sys.stderr)
+
+    def _detect_template(self, roi_img, offset_x, offset_y):
+        """Detect characters using template matching."""
+        gray = cv2.cvtColor(roi_img, cv2.COLOR_BGR2GRAY)
+        results = []
+
+        for char, template in self._templates.items():
+            th, tw = template.shape[:2]
+            if th > gray.shape[0] or tw > gray.shape[1]:
+                continue
+
+            match = cv2.matchTemplate(gray, template, cv2.TM_CCOEFF_NORMED)
+            locations = np.where(match >= self.min_confidence)
+
+            for pt_y, pt_x in zip(*locations):
+                confidence = float(match[pt_y, pt_x])
+                results.append({
+                    "text": char,
+                    "bbox": (offset_x + int(pt_x), offset_y + int(pt_y), tw, th),
+                    "confidence": confidence,
+                })
+
+        # Group nearby detections into words (merge characters within ~5px vertically)
+        if results:
+            results = self._group_characters(results)
+
+        return results
+
+    def _detect_mser(self, roi_img, offset_x, offset_y):
+        """Detect text regions using MSER (no templates needed)."""
+        gray = cv2.cvtColor(roi_img, cv2.COLOR_BGR2GRAY)
+        regions, _ = self._mser.detectRegions(gray)
+        results = []
+
+        for region in regions:
+            x, y, w, h = cv2.boundingRect(region)
+            # Filter by aspect ratio (text characters are typically taller than wide)
+            aspect = h / max(w, 1)
+            if 0.5 < aspect < 5.0 and w > 5 and h > 8:
+                # Extract the region and compute a simple "text-ness" score
+                char_img = gray[y:y+h, x:x+w]
+                # High contrast regions are more likely to be text
+                std_dev = float(np.std(char_img))
+                if std_dev > 30:  # reasonable contrast
+                    results.append({
+                        "text": "?",  # MSER can't identify characters
+                        "bbox": (offset_x + x, offset_y + y, w, h),
+                        "confidence": min(1.0, std_dev / 100.0),
+                    })
+
+        # Merge overlapping detections
+        if results:
+            results = self._merge_overlapping(results)
+
+        return results
+
+    @staticmethod
+    def _group_characters(detections):
+        """Group individual character detections into words by proximity."""
+        if not detections:
+            return detections
+
+        # Sort by x position
+        detections.sort(key=lambda d: d["bbox"][0])
+
+        words = []
+        current_word = [detections[0]]
+
+        for det in detections[1:]:
+            prev = current_word[-1]
+            prev_right = prev["bbox"][0] + prev["bbox"][2]
+            curr_left = det["bbox"][0]
+            # Check vertical alignment (within 5px) and horizontal proximity
+            v_diff = abs(det["bbox"][1] - prev["bbox"][1])
+            h_gap = curr_left - prev_right
+
+            if v_diff < 5 and h_gap < det["bbox"][2] * 1.5:
+                current_word.append(det)
+            else:
+                words.append(current_word)
+                current_word = [det]
+        words.append(current_word)
+
+        # Build word results
+        word_results = []
+        for word_chars in words:
+            text = "".join(d["text"] for d in word_chars)
+            x_min = min(d["bbox"][0] for d in word_chars)
+            y_min = min(d["bbox"][1] for d in word_chars)
+            x_max = max(d["bbox"][0] + d["bbox"][2] for d in word_chars)
+            y_max = max(d["bbox"][1] + d["bbox"][3] for d in word_chars)
+            avg_conf = sum(d["confidence"] for d in word_chars) / len(word_chars)
+            word_results.append({
+                "text": text,
+                "bbox": (x_min, y_min, x_max - x_min, y_max - y_min),
+                "confidence": avg_conf,
+            })
+        return word_results
+
+    @staticmethod
+    def _merge_overlapping(detections):
+        """Merge overlapping bounding boxes."""
+        if len(detections) <= 1:
+            return detections
+
+        merged = []
+        used = set()
+        for i, d1 in enumerate(detections):
+            if i in used:
+                continue
+            x1, y1, w1, h1 = d1["bbox"]
+            group = [d1]
+            for j, d2 in enumerate(detections[i+1:], i+1):
+                if j in used:
+                    continue
+                x2, y2, w2, h2 = d2["bbox"]
+                # Check overlap
+                if (x1 < x2 + w2 and x1 + w1 > x2 and
+                        y1 < y2 + h2 and y1 + h1 > y2):
+                    group.append(d2)
+                    used.add(j)
+            used.add(i)
+            # Merge bounding boxes
+            x_min = min(d["bbox"][0] for d in group)
+            y_min = min(d["bbox"][1] for d in group)
+            x_max = max(d["bbox"][0] + d["bbox"][2] for d in group)
+            y_max = max(d["bbox"][1] + d["bbox"][3] for d in group)
+            best_conf = max(d["confidence"] for d in group)
+            merged.append({
+                "text": "?",
+                "bbox": (x_min, y_min, x_max - x_min, y_max - y_min),
+                "confidence": best_conf,
+            })
+        return merged
+
+
+# ---------------------------------------------------------------------------
 # Low-latency streaming output (pipe / FIFO / v4l2loopback)
 # ---------------------------------------------------------------------------
 
@@ -1237,7 +1614,14 @@ class StreamOutput:
                  pipe_stdout=False, fifo_path=None, v4l2_device=None,
                  hw_decoder=None,
                  controller_device=None,
-                 play=False):
+                 play=False,
+                 # Text detection options
+                 detect_text=False,
+                 text_callback=None,
+                 text_rois=None,
+                 text_template_dir=None,
+                 text_skip_frames=5,
+                 text_min_confidence=0.7):
         self.host = host
         self.regist_key = regist_key
         self.morning = morning
@@ -1256,6 +1640,15 @@ class StreamOutput:
         self.hw_decoder = hw_decoder  # "vaapi", "nvdec", "vdpau", etc.
         self.controller_device = controller_device  # evdev path or "auto"
         self.play = play  # launch ffplay on v4l2 device after writer opens
+
+        # Text detection
+        self.detect_text = detect_text
+        self.text_callback = text_callback
+        self.text_rois = text_rois
+        self.text_template_dir = text_template_dir
+        self.text_skip_frames = text_skip_frames
+        self.text_min_confidence = text_min_confidence
+        self._text_detector = None
 
         self._lib = load_libchiaki(lib_path)
         self._stop_event = threading.Event()
@@ -1476,11 +1869,15 @@ class StreamOutput:
         )
 
         video_fd = self._video_fd
+        text_detector = self._text_detector
 
         def video_cb(buf, buf_size, frames_lost, frame_recovered, user):
             try:
                 data = ctypes.string_at(buf, buf_size)
                 os.write(video_fd, data)
+                # Feed to text detector (non-blocking)
+                if text_detector:
+                    text_detector.feed(data)
                 self._video_frames += 1
                 if self._video_frames % 600 == 0:
                     elapsed = time.time() - (self._start_time or time.time())
@@ -1525,6 +1922,22 @@ class StreamOutput:
             log(f"    GPU decode: {self.hw_decoder}")
         if self.duration:
             log(f"    Duration: {self.duration}s")
+
+        # Start text detector if enabled
+        if self.detect_text:
+            codec_str = "h264" if self.codec == CODEC_H264 else "hevc"
+            callback = self.text_callback or self._default_text_callback
+            self._text_detector = TextDetector(
+                width=self.width, height=self.height, codec=codec_str,
+                on_text_detected=callback,
+                rois=self.text_rois,
+                template_dir=self.text_template_dir,
+                skip_frames=self.text_skip_frames,
+                min_confidence=self.text_min_confidence,
+                hw_decoder=self.hw_decoder,
+                verbose=self.verbose,
+            )
+            self._text_detector.start()
 
         self._open_output()
 
@@ -1648,6 +2061,9 @@ class StreamOutput:
             log(f"[+] Done: {self._video_frames} frames in {elapsed:.1f}s")
 
         finally:
+            if self._text_detector:
+                self._text_detector.stop()
+                self._text_detector = None
             if self._ffplay_proc:
                 self._ffplay_proc.terminate()
                 try:
@@ -1658,6 +2074,14 @@ class StreamOutput:
                     self._ffplay_proc.kill()
                 self._ffplay_proc = None
             self._close_output()
+
+    @staticmethod
+    def _default_text_callback(texts, frame):
+        """Default callback: print detected text to stderr."""
+        for t in texts:
+            x, y, w, h = t["bbox"]
+            print(f"  [text] \"{t['text']}\" at ({x},{y} {w}x{h}) "
+                  f"conf={t['confidence']:.2f}", file=sys.stderr)
 
 
 # ---------------------------------------------------------------------------
@@ -2000,6 +2424,14 @@ Examples:
   sudo modprobe v4l2loopback video_nr=9
   %(prog)s stream --config ps_config.json --v4l2 /dev/video9 --hw-decoder vaapi
 
+  # Stream with real-time text detection (MSER auto-detect, top 15%% of screen)
+  %(prog)s stream --config ps_config.json --play \\
+      --detect-text --text-roi 0.0,0.0,1.0,0.15 --text-skip 10
+
+  # Stream with template matching (provide character images)
+  %(prog)s stream --config ps_config.json --play \\
+      --detect-text --text-templates ./nhl_font/ --text-confidence 0.8
+
   # Wake up a console from standby
   %(prog)s wakeup --host 192.168.1.100 --regist-key <hex> --ps5
 """,
@@ -2072,6 +2504,18 @@ Examples:
                                help="Enable controller input (auto-detect or specify /dev/input/eventX)")
     stream_parser.add_argument("--play", action="store_true",
                                help="Launch ffplay with low-latency flags (auto-creates FIFO, or uses --v4l2/--fifo)")
+    # Text detection options
+    stream_parser.add_argument("--detect-text", action="store_true",
+                               help="Enable real-time text detection on video frames (requires opencv-python)")
+    stream_parser.add_argument("--text-templates", metavar="DIR",
+                               help="Directory with character template images (A.png, B.png, ...) for template matching")
+    stream_parser.add_argument("--text-roi", metavar="X,Y,W,H", action="append",
+                               help="ROI for text detection as normalized fractions (e.g. 0.0,0.0,1.0,0.15 = top 15%%). "
+                                    "Can be specified multiple times. Default: full frame.")
+    stream_parser.add_argument("--text-skip", type=int, default=5,
+                               help="Process every N-th frame for text detection (default: 5)")
+    stream_parser.add_argument("--text-confidence", type=float, default=0.7,
+                               help="Minimum confidence for text detection (0-1, default: 0.7)")
 
     args = parser.parse_args()
 
@@ -2280,6 +2724,17 @@ Examples:
 
         pipe_stdout = not fifo_path and not args.v4l2
 
+        # Parse text detection ROIs
+        text_rois = None
+        if hasattr(args, 'text_roi') and args.text_roi:
+            text_rois = []
+            for roi_str in args.text_roi:
+                parts = [float(x.strip()) for x in roi_str.split(",")]
+                if len(parts) != 4:
+                    print(f"[!] Invalid --text-roi: {roi_str} (expected X,Y,W,H)", file=sys.stderr)
+                    sys.exit(1)
+                text_rois.append(tuple(parts))
+
         streamer = StreamOutput(
             host=host, regist_key=regist_key, morning=morning,
             ps5=ps5, codec=codec, width=width, height=height,
@@ -2290,6 +2745,11 @@ Examples:
             v4l2_device=args.v4l2, hw_decoder=args.hw_decoder,
             controller_device=args.controller,
             play=args.play,
+            detect_text=args.detect_text,
+            text_rois=text_rois,
+            text_template_dir=args.text_templates,
+            text_skip_frames=args.text_skip,
+            text_min_confidence=args.text_confidence,
         )
         streamer.stream()
 
