@@ -1299,13 +1299,13 @@ class TextDetector:
         "mode": [
             "EASHL 3v3", "EASHL 6v6", "EASHL Skater", "EASHL Club",
             "EASHL Drop-In", "EASHL Goalie", "EASHL Ones",
-            "LHEAS 3c3", "LHEAS 6c6", "LHEAS Patineur", "LHEAS Club",
+            "LHEAS 3v3", "LHEAS 6v6", "LHEAS Patineur", "LHEAS Club",
             "LHEAS Gardien", "LHEAS Ones",
             "World of CHEL", "Monde de CHEL",
         ],
         "position": [
-            "C", "LW", "RW", "LD", "RD", "G",
-            "AG", "AD", "DG", "DD",
+            "PAT", "A", "AI", "D", "G", "C",
+            "AD", "AG", "DD", "DG",
         ],
     }
 
