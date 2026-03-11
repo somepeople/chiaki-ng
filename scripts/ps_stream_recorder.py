@@ -1301,7 +1301,8 @@ class TextDetector:
                  ocr_lang=None,
                  verbose=False,
                  name_corrections=None,
-                 holdover_frames=10):
+                 holdover_frames=10,
+                 lineup_config=None):
         """
         Args:
             width, height: Video resolution.
@@ -1326,6 +1327,11 @@ class TextDetector:
             holdover_frames: Number of detection cycles to keep showing the
                 last known result when OCR returns empty (prevents flicker).
                 Default: 10 (~0.8s at skip_frames=5, 60fps input).
+            lineup_config: Path to a JSON file defining lineup ROIs for
+                structured player-card detection (mode, teams, players,
+                fields).  When set, each player frame gets a red overlay
+                and all sub-fields (position, name, height, weight,
+                perk1-3) are OCR'd at their configured relative offsets.
         """
         if not _cv2_available:
             raise RuntimeError(
@@ -1402,6 +1408,11 @@ class TextDetector:
 
         # Real-ESRGAN upscaler (lazy-initialized on first use)
         self._upscaler = None
+
+        # --- Lineup config (structured player-card detection) ---
+        self._lineup_config = None
+        if lineup_config:
+            self._lineup_config = self._load_lineup_config(lineup_config)
 
         # EasyOCR reader (lazy-initialized on first use to avoid slow startup)
         self._easyocr_reader = None
@@ -1742,6 +1753,28 @@ class TextDetector:
                         self._holdover_results.pop(roi_idx, None)
                         self._prev_roi_results.pop(roi_idx, None)
 
+            # Lineup detection (structured player-card ROIs)
+            lineup_data = None
+            if self._lineup_config is not None:
+                try:
+                    lineup_data = self._detect_lineup(frame)
+                    # Flatten lineup results into all_texts for the callback
+                    for team_data in lineup_data.get("teams", {}).values():
+                        for player in team_data.get("players", []):
+                            for fname, fdata in player.get("fields", {}).items():
+                                if fdata["text"]:
+                                    all_texts.append({
+                                        "text": fdata["text"],
+                                        "bbox": fdata["bbox"],
+                                        "confidence": fdata["confidence"],
+                                        "field": fname,
+                                        "team": team_data.get("label", ""),
+                                    })
+                except Exception as e:
+                    if self.verbose:
+                        print(f"  [ocr] lineup detection error: {e}",
+                              file=sys.stderr)
+
             self._detect_count += 1
 
             if self.on_text_detected:
@@ -1753,6 +1786,11 @@ class TextDetector:
             # Debug window: show frame with overlaid detections
             if self.show_window:
                 display = frame.copy()
+
+                # Draw lineup overlay (red player frames + fields)
+                if lineup_data is not None:
+                    self._draw_lineup_overlay(display, lineup_data)
+
                 # Draw ROI rectangles (blue)
                 for roi in self.rois:
                     rx = int(roi[0] * self.width)
@@ -1953,6 +1991,221 @@ class TextDetector:
 
         # Crop to exact 4x of original dimensions
         return result[:h * 4, :w * 4]
+
+    # ------------------------------------------------------------------
+    # Lineup config: structured player-card ROI detection
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _load_lineup_config(path):
+        """Load and validate a lineup JSON config file.
+
+        Returns the parsed config dict, or None on error.
+        """
+        try:
+            with open(path) as f:
+                cfg = json.load(f)
+        except (OSError, json.JSONDecodeError) as e:
+            print(f"[!] lineup-config: failed to load {path}: {e}",
+                  file=sys.stderr)
+            return None
+
+        # Basic validation
+        required_field_keys = {"x", "y", "width", "height"}
+        teams = cfg.get("teams", {})
+        if not teams:
+            print(f"[!] lineup-config: no 'teams' found in {path}",
+                  file=sys.stderr)
+            return None
+
+        total_players = 0
+        for team_key, team in teams.items():
+            players = team.get("players", [])
+            for pi, player in enumerate(players):
+                missing = required_field_keys - set(player.keys())
+                if missing:
+                    print(f"[!] lineup-config: {team_key}.players[{pi}] "
+                          f"missing keys: {missing}", file=sys.stderr)
+                    return None
+                for fname, fbox in player.get("fields", {}).items():
+                    fmissing = required_field_keys - set(fbox.keys())
+                    if fmissing:
+                        print(f"[!] lineup-config: {team_key}.players[{pi}]"
+                              f".fields.{fname} missing: {fmissing}",
+                              file=sys.stderr)
+                        return None
+            total_players += len(players)
+
+        print(f"[+] lineup-config: loaded {path} "
+              f"({len(teams)} teams, {total_players} players)",
+              file=sys.stderr)
+        return cfg
+
+    def _detect_lineup(self, frame):
+        """Run OCR on all lineup ROIs defined in the lineup config.
+
+        For each player frame:
+          - Extracts the player card region from the full frame
+          - OCRs each sub-field (position, name, height, weight, perks)
+            at its configured relative offset within the player card
+          - Returns structured results per team/player
+
+        Returns:
+            dict: {
+                "mode": "detected mode text" or None,
+                "teams": {
+                    "team_a": {
+                        "label": "TEAM A",
+                        "players": [
+                            {
+                                "bbox": (x, y, w, h),
+                                "fields": {
+                                    "position": {"text": "C", "confidence": 0.95, "bbox": (...)},
+                                    "name": {"text": "GRETZKY", ...},
+                                    ...
+                                }
+                            }, ...
+                        ]
+                    }, ...
+                }
+            }
+        """
+        cfg = self._lineup_config
+        result = {"mode": None, "teams": {}}
+
+        # Detect mode field
+        mode_cfg = cfg.get("mode")
+        if mode_cfg:
+            mx, my = mode_cfg["x"], mode_cfg["y"]
+            mw, mh = mode_cfg["width"], mode_cfg["height"]
+            mode_roi = frame[my:my + mh, mx:mx + mw]
+            mode_texts = self._detect_roi(mode_roi, mx, my)
+            if mode_texts:
+                result["mode"] = " ".join(t["text"] for t in mode_texts)
+
+        # Detect each team
+        for team_key, team_cfg in cfg.get("teams", {}).items():
+            team_result = {
+                "label": team_cfg.get("label", team_key),
+                "players": [],
+            }
+            for player in team_cfg.get("players", []):
+                px, py = player["x"], player["y"]
+                pw, ph = player["width"], player["height"]
+
+                # Clamp to frame bounds
+                px = max(0, min(px, self.width - 1))
+                py = max(0, min(py, self.height - 1))
+                pw = min(pw, self.width - px)
+                ph = min(ph, self.height - py)
+
+                player_roi = frame[py:py + ph, px:px + pw]
+                player_result = {
+                    "bbox": (px, py, pw, ph),
+                    "fields": {},
+                }
+
+                # OCR each sub-field at its relative position
+                for field_name, fbox in player.get("fields", {}).items():
+                    fx, fy = fbox["x"], fbox["y"]
+                    fw, fh = fbox["width"], fbox["height"]
+
+                    # Clamp to player card bounds
+                    fx = max(0, min(fx, pw - 1))
+                    fy = max(0, min(fy, ph - 1))
+                    fw = min(fw, pw - fx)
+                    fh = min(fh, ph - fy)
+
+                    field_roi = player_roi[fy:fy + fh, fx:fx + fw]
+                    if field_roi.size == 0:
+                        continue
+
+                    # OCR this small field region
+                    abs_x = px + fx
+                    abs_y = py + fy
+                    texts = self._detect_roi(field_roi, abs_x, abs_y)
+
+                    if texts:
+                        # Take the highest-confidence detection
+                        best = max(texts, key=lambda t: t["confidence"])
+                        player_result["fields"][field_name] = {
+                            "text": best["text"],
+                            "confidence": best["confidence"],
+                            "bbox": (abs_x, abs_y, fw, fh),
+                        }
+                    else:
+                        player_result["fields"][field_name] = {
+                            "text": "",
+                            "confidence": 0.0,
+                            "bbox": (abs_x, abs_y, fw, fh),
+                        }
+
+                team_result["players"].append(player_result)
+            result["teams"][team_key] = team_result
+
+        return result
+
+    def _draw_lineup_overlay(self, display, lineup_data):
+        """Draw red overlay rectangles and OCR results for lineup detection.
+
+        - Player frames: red rectangle (2px border)
+        - Sub-fields: thin red rectangle + detected text label
+        - Mode: yellow rectangle + text
+        """
+        cfg = self._lineup_config
+
+        # Draw mode box (yellow)
+        mode_cfg = cfg.get("mode")
+        if mode_cfg:
+            mx, my = mode_cfg["x"], mode_cfg["y"]
+            mw, mh = mode_cfg["width"], mode_cfg["height"]
+            cv2.rectangle(display, (mx, my), (mx + mw, my + mh),
+                          (0, 255, 255), 2)
+            mode_text = lineup_data.get("mode") or ""
+            if mode_text:
+                cv2.putText(display, mode_text, (mx + 4, my + mh - 6),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                            (0, 255, 255), 1)
+
+        # Draw teams
+        for team_key, team_data in lineup_data.get("teams", {}).items():
+            for player in team_data.get("players", []):
+                px, py, pw, ph = player["bbox"]
+
+                # Red semi-transparent overlay on the player card
+                overlay = display[py:py + ph, px:px + pw].copy()
+                red_tint = np.full_like(overlay, (0, 0, 180), dtype=np.uint8)
+                cv2.addWeighted(red_tint, 0.15, overlay, 0.85, 0,
+                                display[py:py + ph, px:px + pw])
+
+                # Red border around player frame
+                cv2.rectangle(display, (px, py), (px + pw, py + ph),
+                              (0, 0, 255), 2)
+
+                # Draw each detected field
+                for field_name, field_data in player.get("fields", {}).items():
+                    fx, fy, fw, fh = field_data["bbox"]
+                    text = field_data["text"]
+                    conf = field_data["confidence"]
+
+                    # Thin red rectangle around the field
+                    cv2.rectangle(display, (fx, fy), (fx + fw, fy + fh),
+                                  (0, 0, 255), 1)
+
+                    # Field label (top-left, small)
+                    label_color = (100, 100, 255)  # light red
+                    cv2.putText(display, field_name,
+                                (fx + 2, fy - 2),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.3,
+                                label_color, 1)
+
+                    # Detected text (inside the box)
+                    if text:
+                        display_text = f"{text} {conf:.0%}"
+                        cv2.putText(display, display_text,
+                                    (fx + 2, fy + fh - 4),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.4,
+                                    (255, 255, 255), 1)
 
     def _preprocess_roi(self, roi_img):
         """Preprocessing pipeline with neural super-resolution upscaling.
@@ -2454,7 +2707,8 @@ class StreamOutput:
                  debug_window_scale=0.5,
                  ocr_lang=None,
                  name_corrections=None,
-                 holdover_frames=10):
+                 holdover_frames=10,
+                 lineup_config=None):
         self.host = host
         self.regist_key = regist_key
         self.morning = morning
@@ -2486,6 +2740,7 @@ class StreamOutput:
         self.ocr_lang = ocr_lang
         self.name_corrections = name_corrections
         self.holdover_frames = holdover_frames
+        self.lineup_config = lineup_config
         self._text_detector = None
 
         self._lib = load_libchiaki(lib_path)
@@ -2782,6 +3037,7 @@ class StreamOutput:
                 verbose=self.verbose,
                 name_corrections=self.name_corrections,
                 holdover_frames=self.holdover_frames,
+                lineup_config=self.lineup_config,
             )
             self._text_detector.start()
 
@@ -3398,6 +3654,12 @@ Examples:
                                help="Keep showing last detection for N cycles "
                                     "when OCR returns empty (anti-flicker). "
                                     "Default: 10.")
+    stream_parser.add_argument("--lineup-config", metavar="JSON_FILE",
+                               help="JSON config for structured lineup detection. "
+                                    "Defines player card positions per team with "
+                                    "sub-fields (position, name, height, weight, "
+                                    "perks). Each player frame gets a red overlay. "
+                                    "Implies --detect-text.")
 
     args = parser.parse_args()
 
@@ -3646,7 +3908,8 @@ Examples:
             v4l2_device=args.v4l2, hw_decoder=args.hw_decoder,
             controller_device=args.controller,
             play=args.play,
-            detect_text=args.detect_text or args.debug_window,
+            detect_text=(args.detect_text or args.debug_window
+                         or bool(getattr(args, 'lineup_config', None))),
             text_rois=text_rois,
             text_template_dir=args.text_templates,
             text_skip_frames=args.text_skip,
@@ -3656,6 +3919,7 @@ Examples:
             ocr_lang=getattr(args, 'ocr_lang', None),
             name_corrections=_parse_name_corrections(args),
             holdover_frames=getattr(args, 'holdover_frames', 10),
+            lineup_config=getattr(args, 'lineup_config', None),
         )
         streamer.stream()
 

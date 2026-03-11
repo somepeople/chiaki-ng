@@ -1,0 +1,141 @@
+{
+  "mode": {
+    "x": 800,
+    "y": 50,
+    "width": 320,
+    "height": 40,
+    "label": "MODE"
+  },
+  "teams": {
+    "team_a": {
+      "label": "TEAM A",
+      "players": [
+        {
+          "x": 100,
+          "y": 200,
+          "width": 200,
+          "height": 350,
+          "fields": {
+            "position": { "x": 10, "y": 5,   "width": 180, "height": 25 },
+            "name":     { "x": 10, "y": 35,  "width": 180, "height": 25 },
+            "height":   { "x": 10, "y": 65,  "width": 85,  "height": 25 },
+            "weight":   { "x": 100, "y": 65, "width": 85,  "height": 25 },
+            "perk1":    { "x": 10, "y": 100, "width": 180, "height": 25 },
+            "perk2":    { "x": 10, "y": 130, "width": 180, "height": 25 },
+            "perk3":    { "x": 10, "y": 160, "width": 180, "height": 25 }
+          }
+        },
+        {
+          "x": 320,
+          "y": 200,
+          "width": 200,
+          "height": 350,
+          "fields": {
+            "position": { "x": 10, "y": 5,   "width": 180, "height": 25 },
+            "name":     { "x": 10, "y": 35,  "width": 180, "height": 25 },
+            "height":   { "x": 10, "y": 65,  "width": 85,  "height": 25 },
+            "weight":   { "x": 100, "y": 65, "width": 85,  "height": 25 },
+            "perk1":    { "x": 10, "y": 100, "width": 180, "height": 25 },
+            "perk2":    { "x": 10, "y": 130, "width": 180, "height": 25 },
+            "perk3":    { "x": 10, "y": 160, "width": 180, "height": 25 }
+          }
+        },
+        {
+          "x": 540,
+          "y": 200,
+          "width": 200,
+          "height": 350,
+          "fields": {
+            "position": { "x": 10, "y": 5,   "width": 180, "height": 25 },
+            "name":     { "x": 10, "y": 35,  "width": 180, "height": 25 },
+            "height":   { "x": 10, "y": 65,  "width": 85,  "height": 25 },
+            "weight":   { "x": 100, "y": 65, "width": 85,  "height": 25 },
+            "perk1":    { "x": 10, "y": 100, "width": 180, "height": 25 },
+            "perk2":    { "x": 10, "y": 130, "width": 180, "height": 25 },
+            "perk3":    { "x": 10, "y": 160, "width": 180, "height": 25 }
+          }
+        },
+        {
+          "x": 760,
+          "y": 200,
+          "width": 200,
+          "height": 350,
+          "fields": {
+            "position": { "x": 10, "y": 5,   "width": 180, "height": 25 },
+            "name":     { "x": 10, "y": 35,  "width": 180, "height": 25 },
+            "height":   { "x": 10, "y": 65,  "width": 85,  "height": 25 },
+            "weight":   { "x": 100, "y": 65, "width": 85,  "height": 25 },
+            "perk1":    { "x": 10, "y": 100, "width": 180, "height": 25 },
+            "perk2":    { "x": 10, "y": 130, "width": 180, "height": 25 },
+            "perk3":    { "x": 10, "y": 160, "width": 180, "height": 25 }
+          }
+        }
+      ]
+    },
+    "team_b": {
+      "label": "TEAM B",
+      "players": [
+        {
+          "x": 1000,
+          "y": 200,
+          "width": 200,
+          "height": 350,
+          "fields": {
+            "position": { "x": 10, "y": 5,   "width": 180, "height": 25 },
+            "name":     { "x": 10, "y": 35,  "width": 180, "height": 25 },
+            "height":   { "x": 10, "y": 65,  "width": 85,  "height": 25 },
+            "weight":   { "x": 100, "y": 65, "width": 85,  "height": 25 },
+            "perk1":    { "x": 10, "y": 100, "width": 180, "height": 25 },
+            "perk2":    { "x": 10, "y": 130, "width": 180, "height": 25 },
+            "perk3":    { "x": 10, "y": 160, "width": 180, "height": 25 }
+          }
+        },
+        {
+          "x": 1220,
+          "y": 200,
+          "width": 200,
+          "height": 350,
+          "fields": {
+            "position": { "x": 10, "y": 5,   "width": 180, "height": 25 },
+            "name":     { "x": 10, "y": 35,  "width": 180, "height": 25 },
+            "height":   { "x": 10, "y": 65,  "width": 85,  "height": 25 },
+            "weight":   { "x": 100, "y": 65, "width": 85,  "height": 25 },
+            "perk1":    { "x": 10, "y": 100, "width": 180, "height": 25 },
+            "perk2":    { "x": 10, "y": 130, "width": 180, "height": 25 },
+            "perk3":    { "x": 10, "y": 160, "width": 180, "height": 25 }
+          }
+        },
+        {
+          "x": 1440,
+          "y": 200,
+          "width": 200,
+          "height": 350,
+          "fields": {
+            "position": { "x": 10, "y": 5,   "width": 180, "height": 25 },
+            "name":     { "x": 10, "y": 35,  "width": 180, "height": 25 },
+            "height":   { "x": 10, "y": 65,  "width": 85,  "height": 25 },
+            "weight":   { "x": 100, "y": 65, "width": 85,  "height": 25 },
+            "perk1":    { "x": 10, "y": 100, "width": 180, "height": 25 },
+            "perk2":    { "x": 10, "y": 130, "width": 180, "height": 25 },
+            "perk3":    { "x": 10, "y": 160, "width": 180, "height": 25 }
+          }
+        },
+        {
+          "x": 1660,
+          "y": 200,
+          "width": 200,
+          "height": 350,
+          "fields": {
+            "position": { "x": 10, "y": 5,   "width": 180, "height": 25 },
+            "name":     { "x": 10, "y": 35,  "width": 180, "height": 25 },
+            "height":   { "x": 10, "y": 65,  "width": 85,  "height": 25 },
+            "weight":   { "x": 100, "y": 65, "width": 85,  "height": 25 },
+            "perk1":    { "x": 10, "y": 100, "width": 180, "height": 25 },
+            "perk2":    { "x": 10, "y": 130, "width": 180, "height": 25 },
+            "perk3":    { "x": 10, "y": 160, "width": 180, "height": 25 }
+          }
+        }
+      ]
+    }
+  }
+}
