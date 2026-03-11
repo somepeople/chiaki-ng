@@ -1798,42 +1798,55 @@ class TextDetector:
     def _preprocess_roi(roi_img):
         """Advanced preprocessing pipeline to improve OCR accuracy.
 
+        Designed to compensate for H.264/H.265 compression artifacts
+        (blocking, ringing, color quantization) that degrade text edges.
+
         Steps:
-          1. CLAHE (Contrast Limited Adaptive Histogram Equalization) - normalizes
-             contrast across the ROI, critical for game UIs with gradients/shadows
-          2. Bilateral denoise - removes noise while preserving text edges
-          3. Unsharp mask - sharpens text contours for better recognition
-          4. Upscale small ROIs - OCR engines work best on larger images
+          1. Upscale small ROIs (Lanczos for sharper text edges)
+          2. Deblock: median filter to remove H.264 block-boundary artifacts
+          3. CLAHE on luminance channel (contrast normalization)
+          4. Edge-preserving denoise (bilateral filter)
+          5. Unsharp mask (sharpen text contours)
+          6. Morphological close (fill small gaps in text strokes)
         Returns (processed_bgr, processed_gray, scale_factor).
         """
         h, w = roi_img.shape[:2]
 
-        # Upscale small ROIs (most game scoreboards are tiny)
+        # 1) Upscale small ROIs — Lanczos gives sharper edges than cubic
         scale = 1
-        if h < 60:
-            scale = max(2, 60 // h)
+        if h < 80:
+            scale = max(2, 80 // h)
             roi_img = cv2.resize(roi_img, (w * scale, h * scale),
-                                 interpolation=cv2.INTER_CUBIC)
+                                 interpolation=cv2.INTER_LANCZOS4)
 
-        # Convert to LAB for CLAHE on luminance channel only
-        lab = cv2.cvtColor(roi_img, cv2.COLOR_BGR2LAB)
+        # 2) Deblock: median filter smooths H.264 block edges (3x3 is gentle
+        #    enough to preserve text while removing 8x8 block boundaries)
+        deblocked = cv2.medianBlur(roi_img, 3)
+
+        # 3) CLAHE on luminance channel only (preserves color, normalizes
+        #    contrast across gradients and shadows in game UIs)
+        lab = cv2.cvtColor(deblocked, cv2.COLOR_BGR2LAB)
         l_chan, a_chan, b_chan = cv2.split(lab)
-
-        # CLAHE: adaptive contrast enhancement
-        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(4, 4))
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
         l_chan = clahe.apply(l_chan)
-
         lab = cv2.merge([l_chan, a_chan, b_chan])
         enhanced = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
 
-        # Bilateral filter: denoise while keeping edges sharp
-        denoised = cv2.bilateralFilter(enhanced, d=5, sigmaColor=50, sigmaSpace=50)
+        # 4) Edge-preserving denoise (removes compression noise while
+        #    keeping text edges intact)
+        denoised = cv2.bilateralFilter(enhanced, d=7, sigmaColor=40, sigmaSpace=40)
 
-        # Unsharp mask: sharpen text edges
-        blurred = cv2.GaussianBlur(denoised, (0, 0), 2.0)
-        sharpened = cv2.addWeighted(denoised, 1.5, blurred, -0.5, 0)
+        # 5) Unsharp mask: sharpen text edges that were softened by
+        #    compression and the deblocking step
+        blurred = cv2.GaussianBlur(denoised, (0, 0), 1.5)
+        sharpened = cv2.addWeighted(denoised, 1.8, blurred, -0.8, 0)
 
+        # 6) Convert to grayscale + morphological close to fill small
+        #    gaps in text strokes caused by compression artifacts
         gray = cv2.cvtColor(sharpened, cv2.COLOR_BGR2GRAY)
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
+        gray = cv2.morphologyEx(gray, cv2.MORPH_CLOSE, kernel)
+
         return sharpened, gray, scale
 
     def _apply_corrections(self, texts):
@@ -2005,8 +2018,7 @@ class TextDetector:
         elif self._ocr_engine == self.OCR_ENGINE_EASYOCR:
             return self._detect_easyocr(roi_img, offset_x, offset_y)
         elif self._ocr_engine == self.OCR_ENGINE_TESSERACT:
-            gray = cv2.cvtColor(roi_img, cv2.COLOR_BGR2GRAY)
-            return self._detect_tesseract(roi_img, gray, offset_x, offset_y)
+            return self._detect_tesseract(roi_img, offset_x, offset_y)
         else:
             return self._detect_mser(roi_img, offset_x, offset_y)
 
@@ -2074,11 +2086,17 @@ class TextDetector:
 
     def _detect_template(self, roi_img, offset_x, offset_y):
         """Detect characters using template matching."""
-        gray = cv2.cvtColor(roi_img, cv2.COLOR_BGR2GRAY)
+        # Apply full preprocessing pipeline (deblock + CLAHE + denoise + sharpen)
+        _, gray, scale = self._preprocess_roi(roi_img)
         results = []
 
         for char, template in self._templates.items():
             th, tw = template.shape[:2]
+            # Scale template to match upscaled ROI
+            if scale > 1:
+                template = cv2.resize(template, (tw * scale, th * scale),
+                                      interpolation=cv2.INTER_LANCZOS4)
+                th, tw = template.shape[:2]
             if th > gray.shape[0] or tw > gray.shape[1]:
                 continue
 
@@ -2089,7 +2107,9 @@ class TextDetector:
                 confidence = float(match[pt_y, pt_x])
                 results.append({
                     "text": char,
-                    "bbox": (offset_x + int(pt_x), offset_y + int(pt_y), tw, th),
+                    "bbox": (offset_x + int(pt_x) // scale,
+                             offset_y + int(pt_y) // scale,
+                             tw // scale, th // scale),
                     "confidence": confidence,
                 })
 
@@ -2101,7 +2121,8 @@ class TextDetector:
 
     def _detect_mser(self, roi_img, offset_x, offset_y):
         """Detect text regions using MSER (cannot identify characters, shows '?')."""
-        gray = cv2.cvtColor(roi_img, cv2.COLOR_BGR2GRAY)
+        # Apply full preprocessing pipeline for better region detection
+        _, gray, scale = self._preprocess_roi(roi_img)
         regions, _ = self._mser.detectRegions(gray)
         results = []
 
@@ -2117,7 +2138,8 @@ class TextDetector:
                 if std_dev > 30:  # reasonable contrast
                     results.append({
                         "text": "?",  # MSER can't identify characters
-                        "bbox": (offset_x + x, offset_y + y, w, h),
+                        "bbox": (offset_x + x // scale, offset_y + y // scale,
+                                 w // scale, h // scale),
                         "confidence": min(1.0, std_dev / 100.0),
                     })
 
@@ -2127,7 +2149,7 @@ class TextDetector:
 
         return results
 
-    def _detect_tesseract(self, roi_img, gray, offset_x, offset_y):
+    def _detect_tesseract(self, roi_img, offset_x, offset_y):
         """Detect and recognize text using Tesseract OCR with enhanced preprocessing."""
         # Use the shared preprocessing pipeline (CLAHE + denoise + sharpen + upscale)
         _, enhanced_gray, scale = self._preprocess_roi(roi_img)
