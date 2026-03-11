@@ -1322,7 +1322,9 @@ class TextDetector:
                  name_corrections=None,
                  holdover_frames=10,
                  lineup_config=None,
-                 ocr_engine=None):
+                 ocr_engine=None,
+                 calibrate_file=None,
+                 corrections_file=None):
         """
         Args:
             width, height: Video resolution.
@@ -1463,10 +1465,29 @@ class TextDetector:
             self._mser.setMaxArea(2000)
             self._mser.setDelta(5)
 
+        # --- Calibration / corrections file ---
+        # calibrate_file: path to JSON file where raw vs corrected OCR
+        # results are logged for semi-automatic fine-tuning.
+        self._calibrate_file = calibrate_file
+        self._calibrate_log = []  # buffered entries before flush
+        # corrections_file: path to JSON file with user-curated corrections.
+        # Loaded at init (merged with name_corrections), auto-learned
+        # corrections are saved back at shutdown.
+        self._corrections_file = corrections_file
+        if corrections_file:
+            self._load_corrections_file(corrections_file)
+
         print(f"[+] TextDetector OCR engine: {self._ocr_engine}", file=sys.stderr)
         if self._ocr_engine == self.OCR_ENGINE_MSER:
             print("[!] Warning: MSER mode cannot identify characters (shows '?'). "
                   "Install easyocr or pytesseract for real OCR.", file=sys.stderr)
+        if self._calibrate_file:
+            print(f"[+] Calibration mode: logging to {self._calibrate_file}",
+                  file=sys.stderr)
+        if self._corrections_file:
+            print(f"[+] Corrections file: {self._corrections_file} "
+                  f"({len(self._name_corrections)} entries)",
+                  file=sys.stderr)
 
     def _load_templates(self, template_dir):
         """Load character template images from a directory."""
@@ -1482,6 +1503,127 @@ class TextDetector:
         if self._templates:
             print(f"[+] TextDetector: loaded {len(self._templates)} character templates "
                   f"from {template_dir}", file=sys.stderr)
+
+    def _load_corrections_file(self, path):
+        """Load a corrections JSON file and merge into _name_corrections.
+
+        The file format is:
+        {
+            "corrections": {"WRONG_TEXT": "CORRECT_TEXT", ...},
+            "known_values": {"field_name": ["value1", "value2", ...], ...}
+        }
+        """
+        try:
+            with open(path) as f:
+                data = json.load(f)
+        except FileNotFoundError:
+            print(f"[+] Corrections file not found, will create: {path}",
+                  file=sys.stderr)
+            return
+        except (json.JSONDecodeError, OSError) as e:
+            print(f"[!] Error reading corrections file: {e}", file=sys.stderr)
+            return
+
+        # Merge corrections
+        corrections = data.get("corrections", {})
+        for wrong, correct in corrections.items():
+            self._name_corrections[wrong.upper()] = correct
+        print(f"[+] Loaded {len(corrections)} corrections from {path}",
+              file=sys.stderr)
+
+        # Merge known values
+        known = data.get("known_values", {})
+        for field, values in known.items():
+            if field in self.KNOWN_VALUES:
+                existing = set(self.KNOWN_VALUES[field])
+                for v in values:
+                    if v not in existing:
+                        self.KNOWN_VALUES[field].append(v)
+            else:
+                self.KNOWN_VALUES[field] = list(values)
+        if known:
+            print(f"[+] Loaded known values for fields: {list(known.keys())}",
+                  file=sys.stderr)
+
+    def _save_corrections_file(self):
+        """Save current corrections (user + auto-learned) to the corrections file."""
+        if not self._corrections_file:
+            return
+
+        # Load existing file to preserve structure
+        data = {"corrections": {}, "known_values": {}}
+        try:
+            with open(self._corrections_file) as f:
+                data = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            pass
+
+        # Merge auto-learned corrections into the file
+        corrections = data.get("corrections", {})
+        new_count = 0
+        for wrong, correct in self._auto_corrections.items():
+            if wrong not in corrections:
+                corrections[wrong] = correct
+                new_count += 1
+        data["corrections"] = corrections
+
+        # Preserve known_values from KNOWN_VALUES (include any runtime additions)
+        data["known_values"] = {k: list(v) for k, v in self.KNOWN_VALUES.items()}
+
+        try:
+            with open(self._corrections_file, "w") as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+            if new_count:
+                print(f"[+] Saved {new_count} new auto-learned corrections "
+                      f"to {self._corrections_file}", file=sys.stderr)
+        except OSError as e:
+            print(f"[!] Error saving corrections file: {e}", file=sys.stderr)
+
+    def _log_calibration(self, field_name, raw_text, corrected_text,
+                         confidence, bbox):
+        """Buffer a calibration entry (raw vs corrected OCR result).
+
+        Entries are flushed to the calibration file periodically and at shutdown.
+        """
+        if not self._calibrate_file:
+            return
+
+        import time as _time
+        entry = {
+            "timestamp": _time.time(),
+            "field": field_name,
+            "raw": raw_text,
+            "corrected": corrected_text,
+            "changed": raw_text != corrected_text,
+            "confidence": round(confidence, 3),
+            "bbox": list(bbox),
+        }
+        self._calibrate_log.append(entry)
+
+        # Flush every 50 entries to avoid losing data
+        if len(self._calibrate_log) >= 50:
+            self._flush_calibration()
+
+    def _flush_calibration(self):
+        """Append buffered calibration entries to the calibration JSON file."""
+        if not self._calibrate_file or not self._calibrate_log:
+            return
+
+        # Load existing entries
+        existing = []
+        try:
+            with open(self._calibrate_file) as f:
+                existing = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            pass
+
+        existing.extend(self._calibrate_log)
+        try:
+            with open(self._calibrate_file, "w") as f:
+                json.dump(existing, f, indent=2, ensure_ascii=False)
+        except OSError as e:
+            print(f"[!] Error writing calibration file: {e}", file=sys.stderr)
+        self._calibrate_log.clear()
 
     def start(self):
         """Start the decoder and detection thread.
@@ -1591,6 +1733,9 @@ class TextDetector:
         if self._detect_count > 0:
             print(f"[+] TextDetector stopped: processed {self._detect_count} frames",
                   file=sys.stderr)
+        # Flush calibration log and save corrections on shutdown
+        self._flush_calibration()
+        self._save_corrections_file()
 
     def feed(self, h264_data):
         """Feed raw H.264/H.265 data to the decoder. Truly non-blocking.
@@ -1985,6 +2130,9 @@ class TextDetector:
                 raw_mode = " ".join(t["text"] for t in mode_texts)
                 result["mode"] = self._fuzzy_match_known(
                     raw_mode, self.KNOWN_VALUES.get("mode", []))
+                best_conf = max(t["confidence"] for t in mode_texts)
+                self._log_calibration("mode", raw_mode, result["mode"],
+                                      best_conf, (mx, my, mw, mh))
 
         # Detect each team
         for team_key, team_cfg in cfg.get("teams", {}).items():
@@ -2062,12 +2210,16 @@ class TextDetector:
                     if texts:
                         # Take the highest-confidence detection
                         best = max(texts, key=lambda t: t["confidence"])
-                        text = best["text"]
+                        raw_text = best["text"]
+                        text = raw_text
                         # Apply known-value correction for fields with
                         # constrained vocabularies (position, etc.)
                         known = self.KNOWN_VALUES.get(field_name)
                         if known:
                             text = self._fuzzy_match_known(text, known)
+                        self._log_calibration(field_name, raw_text, text,
+                                              best["confidence"],
+                                              (abs_x, abs_y, fw, fh))
                         player_result["fields"][field_name] = {
                             "text": text,
                             "confidence": best["confidence"],
@@ -2768,7 +2920,9 @@ class StreamOutput:
                  name_corrections=None,
                  holdover_frames=10,
                  lineup_config=None,
-                 ocr_engine=None):
+                 ocr_engine=None,
+                 calibrate_file=None,
+                 corrections_file=None):
         self.host = host
         self.regist_key = regist_key
         self.morning = morning
@@ -2802,6 +2956,8 @@ class StreamOutput:
         self.holdover_frames = holdover_frames
         self.lineup_config = lineup_config
         self.ocr_engine = ocr_engine
+        self.calibrate_file = calibrate_file
+        self.corrections_file = corrections_file
         self._text_detector = None
 
         self._lib = load_libchiaki(lib_path)
@@ -3100,6 +3256,8 @@ class StreamOutput:
                 holdover_frames=self.holdover_frames,
                 lineup_config=self.lineup_config,
                 ocr_engine=self.ocr_engine,
+                calibrate_file=self.calibrate_file,
+                corrections_file=self.corrections_file,
             )
             self._text_detector.start()
 
@@ -3729,6 +3887,16 @@ Examples:
                                     "sub-fields (position, name, height, weight, "
                                     "perks). Each player frame gets a red overlay. "
                                     "Implies --detect-text.")
+    stream_parser.add_argument("--calibrate", metavar="JSON_FILE",
+                               help="Enable calibration mode: log raw vs corrected OCR "
+                                    "results to the specified JSON file. Use this to "
+                                    "review OCR accuracy and build a corrections file.")
+    stream_parser.add_argument("--corrections-file", metavar="JSON_FILE",
+                               help="JSON file with curated OCR corrections and known "
+                                    "values. Loaded at startup; auto-learned corrections "
+                                    "are saved back on shutdown. "
+                                    "Format: {\"corrections\": {\"WRONG\": \"RIGHT\"}, "
+                                    "\"known_values\": {\"field\": [\"val1\", ...]}}")
 
     args = parser.parse_args()
 
@@ -3990,6 +4158,8 @@ Examples:
             holdover_frames=getattr(args, 'holdover_frames', 10),
             lineup_config=getattr(args, 'lineup_config', None),
             ocr_engine=getattr(args, 'ocr_engine', None),
+            calibrate_file=getattr(args, 'calibrate', None),
+            corrections_file=getattr(args, 'corrections_file', None),
         )
         streamer.stream()
 
