@@ -2043,21 +2043,27 @@ class TextDetector:
         for team_key, team_data in lineup_data.get("teams", {}).items():
             players = team_data.get("players", [])
 
-            # Draw team label above the team's player group
+            # Draw team label — position from config or auto-centered
             label = team_data.get("label", team_key)
-            if players:
-                # Compute bounding box spanning all players in this team
+            team_cfg = cfg.get("teams", {}).get(team_key, {})
+            font = cv2.FONT_HERSHEY_SIMPLEX
+            font_scale = 0.7
+            thickness = 2
+            if "label_x" in team_cfg and "label_y" in team_cfg:
+                tx = team_cfg["label_x"]
+                ty = team_cfg["label_y"]
+            elif players:
+                # Fallback: center above the team's player group
                 min_x = min(p["bbox"][0] for p in players)
                 max_x = max(p["bbox"][0] + p["bbox"][2] for p in players)
                 min_y = min(p["bbox"][1] for p in players)
-                # Center label horizontally over the team
-                font = cv2.FONT_HERSHEY_SIMPLEX
-                font_scale = 0.7
-                thickness = 2
-                (tw, th), _ = cv2.getTextSize(label, font, font_scale, thickness)
+                (tw, _th), _ = cv2.getTextSize(label, font, font_scale, thickness)
                 tx = min_x + (max_x - min_x - tw) // 2
                 ty = min_y - 10
-                # Background rectangle for readability
+            else:
+                tx = None
+            if tx is not None:
+                (tw, th), _ = cv2.getTextSize(label, font, font_scale, thickness)
                 cv2.rectangle(display, (tx - 4, ty - th - 4),
                               (tx + tw + 4, ty + 4), (0, 0, 0), -1)
                 cv2.putText(display, label, (tx, ty), font,
