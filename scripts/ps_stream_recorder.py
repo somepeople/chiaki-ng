@@ -1806,7 +1806,8 @@ class TextDetector:
 
     # URL for the Real-ESRGAN x4plus ONNX model (auto-downloaded on first use)
     _ESRGAN_ONNX_URL = (
-        "https://huggingface.co/qualcomm/Real-ESRGAN-x4plus/resolve/main/"
+        "https://huggingface.co/qualcomm/Real-ESRGAN-x4plus/resolve/"
+        "01179a4da7bf5ac91faca650e6afbf282ac93933/"
         "Real-ESRGAN-x4plus.onnx"
     )
 
