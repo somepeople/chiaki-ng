@@ -52,6 +52,7 @@ License: AGPL-3.0-only-OpenSSL (same as chiaki-ng)
 
 import argparse
 import base64
+import hashlib
 import ctypes
 import ctypes.util
 import json
@@ -1485,6 +1486,7 @@ class TextDetector:
         # their OCR labels for building a training dataset.
         self._collect_crops_dir = collect_crops
         self._crop_counter = 0
+        self._crop_seen = set()  # dedup: (field, team, player, text, img_hash)
         if collect_crops:
             os.makedirs(collect_crops, exist_ok=True)
 
@@ -1646,6 +1648,23 @@ class TextDetector:
             print(f"[!] Error writing calibration file: {e}", file=sys.stderr)
         self._calibrate_log.clear()
 
+    @staticmethod
+    def _img_hash(img, size=8):
+        """Compute a fast perceptual hash (average-hash) of an image.
+
+        Downscales to *size* x *size* grayscale and thresholds against the
+        mean, yielding a compact fingerprint that tolerates minor noise
+        between successive frames.
+        """
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if len(img.shape) == 3 else img
+        small = cv2.resize(gray, (size, size), interpolation=cv2.INTER_AREA)
+        avg = small.mean()
+        bits = (small > avg).flatten()
+        # Pack bits into bytes and hash for a fixed-length key
+        packed = bytes(int("".join(str(int(b)) for b in bits[i:i+8]), 2)
+                       for i in range(0, len(bits), 8))
+        return hashlib.md5(packed).hexdigest()
+
     def _save_crop(self, roi_img, field_name, text, confidence,
                    team_key="unknown", player_idx=0):
         """Save a ROI crop image for fine-tuning dataset collection.
@@ -1659,9 +1678,20 @@ class TextDetector:
         dataset stays portable:
 
             images/team_a/0/gamertag/crop_000001.png\tPlayerName
+
+        Deduplication: crops with the same (field, team, player, text,
+        perceptual-hash) are saved only once, which massively reduces
+        the dataset size for static HUD elements that repeat every frame.
         """
         if not self._collect_crops_dir or not text or confidence < 0.5:
             return
+
+        # ---- deduplication ----
+        img_h = self._img_hash(roi_img)
+        dedup_key = (field_name, team_key, player_idx, text, img_h)
+        if dedup_key in self._crop_seen:
+            return
+        self._crop_seen.add(dedup_key)
 
         self._crop_counter += 1
         # Sanitize team_key for filesystem safety
