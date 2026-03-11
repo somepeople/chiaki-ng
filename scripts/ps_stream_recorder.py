@@ -1237,6 +1237,13 @@ try:
 except ImportError:
     pass
 
+_paddleocr_available = False
+try:
+    from paddleocr import PaddleOCR as _PaddleOCR
+    _paddleocr_available = True
+except ImportError:
+    pass
+
 _av_available = False
 try:
     import av
@@ -1279,6 +1286,7 @@ class TextDetector:
 
     # OCR engine priority order (highest to lowest)
     OCR_ENGINE_EASYOCR = "easyocr"
+    OCR_ENGINE_PADDLEOCR = "paddleocr"
     OCR_ENGINE_TESSERACT = "tesseract"
     OCR_ENGINE_TEMPLATE = "template"
     OCR_ENGINE_MSER = "mser"  # fallback, cannot identify characters
@@ -1412,14 +1420,17 @@ class TextDetector:
             except OSError:
                 pass
 
-        # EasyOCR reader (lazy-initialized on first use to avoid slow startup)
+        # OCR readers (lazy-initialized on first use to avoid slow startup)
         self._easyocr_reader = None
+        self._paddleocr_reader = None
 
         # Determine active OCR engine (CLI override or auto-detect)
         if ocr_engine:
             self._ocr_engine = ocr_engine
         elif self._templates:
             self._ocr_engine = self.OCR_ENGINE_TEMPLATE
+        elif _paddleocr_available:
+            self._ocr_engine = self.OCR_ENGINE_PADDLEOCR
         elif _easyocr_available:
             self._ocr_engine = self.OCR_ENGINE_EASYOCR
         elif _tesseract_available:
@@ -2304,6 +2315,8 @@ class TextDetector:
         """Dispatch to the active OCR engine with preprocessing."""
         if self._ocr_engine == self.OCR_ENGINE_TEMPLATE:
             return self._detect_template(roi_img, offset_x, offset_y)
+        elif self._ocr_engine == self.OCR_ENGINE_PADDLEOCR:
+            return self._detect_paddleocr(roi_img, offset_x, offset_y)
         elif self._ocr_engine == self.OCR_ENGINE_EASYOCR:
             return self._detect_easyocr(roi_img, offset_x, offset_y)
         elif self._ocr_engine == self.OCR_ENGINE_TESSERACT:
@@ -2311,6 +2324,47 @@ class TextDetector:
             return self._detect_tesseract(roi_img, gray, offset_x, offset_y)
         else:
             return self._detect_mser(roi_img, offset_x, offset_y)
+
+    def _detect_paddleocr(self, roi_img, offset_x, offset_y):
+        """Detect and recognize text using PaddleOCR (GPU-accelerated)."""
+        if self._paddleocr_reader is None:
+            use_gpu = False
+            try:
+                import paddle
+                use_gpu = paddle.device.is_compiled_with_cuda()
+            except (ImportError, Exception):
+                pass
+
+            lang = self.ocr_lang[0] if self.ocr_lang else "en"
+            print(f"[+] PaddleOCR: initializing (lang={lang}, gpu={use_gpu})...",
+                  file=sys.stderr)
+            self._paddleocr_reader = _PaddleOCR(
+                use_angle_cls=False, lang=lang, use_gpu=use_gpu,
+                show_log=False)
+            print("[+] PaddleOCR: ready.", file=sys.stderr)
+
+        result = self._paddleocr_reader.ocr(roi_img, cls=False)
+
+        results = []
+        if not result or not result[0]:
+            return results
+
+        for line in result[0]:
+            bbox_pts, (text, conf) = line
+            if conf < self.min_confidence:
+                continue
+            xs = [int(p[0]) for p in bbox_pts]
+            ys = [int(p[1]) for p in bbox_pts]
+            x = min(xs)
+            y = min(ys)
+            w = max(xs) - x
+            h = max(ys) - y
+            results.append({
+                "text": text,
+                "bbox": (offset_x + x, offset_y + y, w, h),
+                "confidence": float(conf),
+            })
+        return results
 
     def _detect_easyocr(self, roi_img, offset_x, offset_y):
         """Detect and recognize text using EasyOCR (neural network)."""
@@ -3519,9 +3573,9 @@ Examples:
     stream_parser.add_argument("--debug-scale", type=float, default=0.5,
                                help="Scale factor for debug window (default: 0.5 = half size)")
     stream_parser.add_argument("--ocr-engine",
-                               choices=["easyocr", "tesseract"],
+                               choices=["paddleocr", "easyocr", "tesseract"],
                                help="Force OCR engine instead of auto-detecting. "
-                                    "Default: auto (easyocr > tesseract > mser).")
+                                    "Default: auto (paddleocr > easyocr > tesseract > mser).")
     stream_parser.add_argument("--ocr-lang", metavar="LANG", action="append",
                                help="OCR language for EasyOCR (e.g. en, fr). "
                                     "Can be specified multiple times. Default: en.")
