@@ -2353,7 +2353,7 @@ class TextDetector:
 
                 # OCR each sub-field at its relative position
                 for field_name, fbox in player.get("fields", {}).items():
-                    if field_name in pre_detect_fields:
+                    if field_name in ("ia", "niveau"):
                         continue  # already processed above
 
                     fx, fy = fbox["x"], fbox["y"]
