@@ -2281,8 +2281,53 @@ class TextDetector:
                             player_is_ready = self._detect_ready_color(ready_roi)
                         break
 
+                # Pre-detect "ia" field to identify AI players.
+                # AI players (ia == "IA") are skipped for OCR/crops.
+                player_is_ia = False
+                ia_fbox = player.get("fields", {}).get("ia")
+                if ia_fbox:
+                    ix = max(0, min(ia_fbox["x"], pw - 1))
+                    iy = max(0, min(ia_fbox["y"], ph - 1))
+                    iw = min(ia_fbox["width"], pw - ix)
+                    ih = min(ia_fbox["height"], ph - iy)
+                    ia_roi = player_roi[iy:iy + ih, ix:ix + iw]
+                    if ia_roi.size > 0:
+                        ia_texts = self._detect_roi(ia_roi, px + ix, py + iy)
+                        if ia_texts:
+                            ia_best = max(ia_texts,
+                                          key=lambda t: t["confidence"])
+                            ia_text = ia_best["text"].strip().upper()
+                            player_is_ia = (ia_text == "IA")
+                    player_result["fields"]["ia"] = {
+                        "text": "IA" if player_is_ia else "",
+                        "confidence": 1.0 if player_is_ia else 0.0,
+                        "bbox": (px + ix, py + iy, iw, ih),
+                    }
+
+                player_result["is_ia"] = player_is_ia
+
+                # AI players: skip OCR and crop capture for all fields
+                if player_is_ia:
+                    for field_name, fbox in player.get("fields", {}).items():
+                        if field_name == "ia":
+                            continue
+                        fx = max(0, min(fbox["x"], pw - 1))
+                        fy = max(0, min(fbox["y"], ph - 1))
+                        fw = min(fbox["width"], pw - fx)
+                        fh = min(fbox["height"], ph - fy)
+                        player_result["fields"][field_name] = {
+                            "text": "",
+                            "confidence": 0.0,
+                            "bbox": (px + fx, py + fy, fw, fh),
+                        }
+                    team_result["players"].append(player_result)
+                    continue
+
                 # OCR each sub-field at its relative position
                 for field_name, fbox in player.get("fields", {}).items():
+                    if field_name == "ia":
+                        continue  # already processed above
+
                     fx, fy = fbox["x"], fbox["y"]
                     fw, fh = fbox["width"], fbox["height"]
 
@@ -2369,9 +2414,14 @@ class TextDetector:
                 "players": [],
             }
             for player in team_data.get("players", []):
+                # Skip IA players – only collect positioned human players
+                if player.get("is_ia", False):
+                    continue
                 fields = player.get("fields", {})
                 player_out = {}
                 for fname, fdata in fields.items():
+                    if fname == "ia":
+                        continue
                     if fname == "ready":
                         player_out["ready"] = fdata.get("ready", False)
                     else:
@@ -2431,10 +2481,12 @@ class TextDetector:
 
             for player in players:
                 px, py, pw, ph = player["bbox"]
+                is_ia = player.get("is_ia", False)
 
-                # Red border around player frame
+                # White border for IA players, red for human players
+                border_color = (255, 255, 255) if is_ia else (0, 0, 255)
                 cv2.rectangle(display, (px, py), (px + pw, py + ph),
-                              (0, 0, 255), 2)
+                              border_color, 2)
 
                 # Draw each field contour
                 for field_name, field_data in player.get("fields", {}).items():
@@ -2447,8 +2499,9 @@ class TextDetector:
                         cv2.rectangle(display, (fx, fy), (fx + fw, fy + fh),
                                       color, 2)
                     else:
+                        field_color = (255, 255, 255) if is_ia else (0, 0, 255)
                         cv2.rectangle(display, (fx, fy), (fx + fw, fy + fh),
-                                      (0, 0, 255), 1)
+                                      field_color, 1)
 
     def _apply_corrections(self, texts):
         """Apply name corrections (exact dict + auto-learned) to OCR results.
