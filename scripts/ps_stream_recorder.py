@@ -1303,10 +1303,16 @@ class TextDetector:
 
         self._ffmpeg_proc = None
         self._decoder_thread = None
+        self._reader_thread = None
         self._writer_thread = None
         self._stop_event = threading.Event()
         self._frame_count = 0
         self._detect_count = 0
+        # Latest-frame buffer: reader thread writes, detection thread reads.
+        # Only the most recent frame is kept so detection always uses fresh data.
+        self._latest_frame = None
+        self._frame_lock = threading.Lock()
+        self._frame_ready = threading.Event()
         # Lock-free write buffer: video callback drops data here,
         # a dedicated writer thread picks it up. Only the latest
         # chunk is kept to avoid backpressure on the video callback.
@@ -1377,7 +1383,14 @@ class TextDetector:
         )
         self._writer_thread.start()
 
-        # Reader/detection thread: reads decoded frames and runs OCR
+        # Reader thread: reads decoded frames as fast as possible,
+        # keeps only the latest frame to avoid lag.
+        self._reader_thread = threading.Thread(
+            target=self._reader_loop, daemon=True, name="FrameReader"
+        )
+        self._reader_thread.start()
+
+        # Detection thread: picks up the latest frame and runs OCR
         self._decoder_thread = threading.Thread(
             target=self._detection_loop, daemon=True, name="TextDetector"
         )
@@ -1390,6 +1403,7 @@ class TextDetector:
     def stop(self):
         """Stop the detector and clean up."""
         self._stop_event.set()
+        self._frame_ready.set()  # unblock detection thread
         self._write_event.set()  # unblock writer thread
         if self._writer_thread:
             self._writer_thread.join(timeout=3)
@@ -1405,6 +1419,9 @@ class TextDetector:
             except Exception:
                 self._ffmpeg_proc.kill()
             self._ffmpeg_proc = None
+        if self._reader_thread:
+            self._reader_thread.join(timeout=3)
+            self._reader_thread = None
         if self._decoder_thread:
             self._decoder_thread.join(timeout=3)
             self._decoder_thread = None
@@ -1452,17 +1469,21 @@ class TextDetector:
                 except (BrokenPipeError, OSError):
                     break
 
-    def _detection_loop(self):
-        """Background thread: read decoded frames and run text detection."""
+    def _reader_loop(self):
+        """Background thread: reads decoded frames as fast as possible.
+
+        Keeps only the latest frame in _latest_frame so the detection
+        thread always works on the most recent data (no lag buildup).
+        """
         frame_size = self.width * self.height * 3  # BGR24
         stdout = self._ffmpeg_proc.stdout
         frame_idx = 0
+        dropped = 0
 
         print(f"  [ocr] Waiting for first decoded frame ({frame_size} bytes = "
               f"{self.width}x{self.height} BGR24)...", file=sys.stderr)
 
         while not self._stop_event.is_set():
-            # Read one full frame
             try:
                 raw = stdout.read(frame_size)
             except Exception as e:
@@ -1470,24 +1491,55 @@ class TextDetector:
                 break
             if len(raw) != frame_size:
                 if len(raw) > 0:
-                    print(f"  [ocr] Partial frame: {len(raw)}/{frame_size} bytes", file=sys.stderr)
+                    print(f"  [ocr] Partial frame: {len(raw)}/{frame_size} bytes",
+                          file=sys.stderr)
                 else:
                     print(f"  [ocr] FFmpeg decoder EOF", file=sys.stderr)
-                break  # EOF or error
+                break
 
             frame_idx += 1
             if frame_idx == 1:
-                print(f"  [ocr] First frame decoded! Processing every {self.skip_frames}th frame.",
-                      file=sys.stderr)
+                print(f"  [ocr] First frame decoded!", file=sys.stderr)
 
             # Skip frames for performance
             if frame_idx % self.skip_frames != 0:
                 continue
 
-            # Convert to numpy array
+            # Convert to numpy and store as latest frame (overwrite previous)
             frame = np.frombuffer(raw, dtype=np.uint8).reshape(
                 (self.height, self.width, 3)
-            )
+            ).copy()  # copy() because frombuffer returns read-only
+
+            with self._frame_lock:
+                if self._latest_frame is not None:
+                    dropped += 1
+                self._latest_frame = frame
+            self._frame_ready.set()
+
+        # Signal detection thread that no more frames are coming
+        self._stop_event.set()
+        self._frame_ready.set()
+        if dropped > 0 and self.verbose:
+            print(f"  [ocr] Reader done. Dropped {dropped} stale frames "
+                  f"(detection was slower than input).", file=sys.stderr)
+
+    def _detection_loop(self):
+        """Background thread: picks up the latest frame and runs text detection."""
+
+        while not self._stop_event.is_set():
+            # Wait for a frame to be available
+            self._frame_ready.wait(timeout=0.5)
+            if self._stop_event.is_set():
+                break
+
+            # Grab latest frame (atomic swap to None)
+            with self._frame_lock:
+                frame = self._latest_frame
+                self._latest_frame = None
+            self._frame_ready.clear()
+
+            if frame is None:
+                continue
 
             # Run detection on each ROI
             all_texts = []
@@ -1515,7 +1567,7 @@ class TextDetector:
             # Debug window: show frame with overlaid detections
             if self.show_window:
                 display = frame.copy()
-                # Draw ROI rectangles (blue dashed)
+                # Draw ROI rectangles (blue)
                 for roi in self.rois:
                     rx = int(roi[0] * self.width)
                     ry = int(roi[1] * self.height)
@@ -1527,23 +1579,20 @@ class TextDetector:
                 for t in all_texts:
                     bx, by, bw, bh = t["bbox"]
                     conf = t["confidence"]
-                    # Green box for detections
                     cv2.rectangle(display, (bx, by), (bx + bw, by + bh),
                                   (0, 255, 0), 2)
-                    # Label with text and confidence
                     label = f"{t['text']} {conf:.0%}"
-                    # Background rectangle for readability
                     (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX,
                                                    0.5, 1)
                     cv2.rectangle(display, (bx, by - th - 6), (bx + tw + 4, by),
                                   (0, 0, 0), -1)
                     cv2.putText(display, label, (bx + 2, by - 4),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
-                # FPS / stats overlay
+                # Stats overlay
                 stats = f"Frame #{self._detect_count} | {len(all_texts)} detections"
                 cv2.putText(display, stats, (10, display.shape[0] - 10),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 1)
-                # Scale down if requested
+                # Scale
                 if self.window_scale != 1.0:
                     new_w = int(display.shape[1] * self.window_scale)
                     new_h = int(display.shape[0] * self.window_scale)
