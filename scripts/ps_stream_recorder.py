@@ -1356,7 +1356,7 @@ class TextDetector:
             cmd,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL if not self.verbose else None,
+            stderr=None,  # show FFmpeg errors on stderr for debugging
             bufsize=self.width * self.height * 3 * 2,  # buffer ~2 frames
         )
 
@@ -1398,8 +1398,16 @@ class TextDetector:
                 try:
                     self._ffmpeg_proc.stdin.write(h264_data)
                     self._ffmpeg_proc.stdin.flush()
-                except (BrokenPipeError, OSError):
-                    pass
+                    self._frame_count += 1
+                    if self._frame_count == 1:
+                        print(f"  [ocr] First NAL unit fed to decoder ({len(h264_data)} bytes)",
+                              file=sys.stderr)
+                    elif self._frame_count % 600 == 0:
+                        print(f"  [ocr] Fed {self._frame_count} NAL units to decoder",
+                              file=sys.stderr)
+                except (BrokenPipeError, OSError) as e:
+                    if self._frame_count <= 1:
+                        print(f"  [ocr] Decoder pipe error: {e}", file=sys.stderr)
 
     def _detection_loop(self):
         """Background thread: read decoded frames and run text detection."""
@@ -1407,16 +1415,28 @@ class TextDetector:
         stdout = self._ffmpeg_proc.stdout
         frame_idx = 0
 
+        print(f"  [ocr] Waiting for first decoded frame ({frame_size} bytes = "
+              f"{self.width}x{self.height} BGR24)...", file=sys.stderr)
+
         while not self._stop_event.is_set():
             # Read one full frame
             try:
                 raw = stdout.read(frame_size)
-            except Exception:
+            except Exception as e:
+                print(f"  [ocr] Read error: {e}", file=sys.stderr)
                 break
             if len(raw) != frame_size:
+                if len(raw) > 0:
+                    print(f"  [ocr] Partial frame: {len(raw)}/{frame_size} bytes", file=sys.stderr)
+                else:
+                    print(f"  [ocr] FFmpeg decoder EOF", file=sys.stderr)
                 break  # EOF or error
 
             frame_idx += 1
+            if frame_idx == 1:
+                print(f"  [ocr] First frame decoded! Processing every {self.skip_frames}th frame.",
+                      file=sys.stderr)
+
             # Skip frames for performance
             if frame_idx % self.skip_frames != 0:
                 continue
@@ -1869,15 +1889,18 @@ class StreamOutput:
         )
 
         video_fd = self._video_fd
-        text_detector = self._text_detector
+        # Use self reference (not closure capture) so detector is found
+        # even if it's created after this callback is built
+        stream_self = self
 
         def video_cb(buf, buf_size, frames_lost, frame_recovered, user):
             try:
                 data = ctypes.string_at(buf, buf_size)
                 os.write(video_fd, data)
                 # Feed to text detector (non-blocking)
-                if text_detector:
-                    text_detector.feed(data)
+                td = stream_self._text_detector
+                if td:
+                    td.feed(data)
                 self._video_frames += 1
                 if self._video_frames % 600 == 0:
                     elapsed = time.time() - (self._start_time or time.time())
