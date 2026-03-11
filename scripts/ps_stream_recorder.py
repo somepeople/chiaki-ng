@@ -1337,7 +1337,7 @@ class TextDetector:
         self.height = height
         self.codec = codec
         self.on_text_detected = on_text_detected
-        self.rois = rois or [(0.0, 0.0, 1.0, 1.0)]
+        self.rois = rois or []
         self.template_dir = template_dir
         self.skip_frames = max(1, skip_frames)
         self.min_confidence = min_confidence
