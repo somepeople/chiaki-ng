@@ -1292,7 +1292,9 @@ class TextDetector:
                  show_window=False,
                  window_scale=1.0,
                  ocr_lang=None,
-                 verbose=False):
+                 verbose=False,
+                 name_corrections=None,
+                 holdover_frames=10):
         """
         Args:
             width, height: Video resolution.
@@ -1311,6 +1313,12 @@ class TextDetector:
             ocr_lang: OCR language(s) for EasyOCR (e.g. ["en"] or ["en","fr"]).
                       Default: ["en"].
             verbose: Print debug info.
+            name_corrections: Dict mapping common OCR errors to correct text,
+                e.g. {"PLRYER1": "PLAYER1", "xXSn1perXx": "xXSniperXx"}.
+                Also supports fuzzy matching for close misspellings.
+            holdover_frames: Number of detection cycles to keep showing the
+                last known result when OCR returns empty (prevents flicker).
+                Default: 10 (~0.8s at skip_frames=5, 60fps input).
         """
         if not _cv2_available:
             raise RuntimeError(
@@ -1331,6 +1339,25 @@ class TextDetector:
         self.window_scale = window_scale
         self.ocr_lang = ocr_lang or ["en"]
         self.verbose = verbose
+
+        # --- Name corrections (exact + fuzzy) ---
+        # Exact map: {"PLRYER1": "PLAYER1"}
+        self._name_corrections = {}
+        if name_corrections:
+            # Normalize keys to upper-case for case-insensitive matching
+            self._name_corrections = {k.upper(): v for k, v in name_corrections.items()}
+            print(f"[+] TextDetector: {len(self._name_corrections)} name corrections loaded",
+                  file=sys.stderr)
+        # Auto-learned corrections: when the same bbox consistently shows
+        # text X after initially showing text Y, remember Y→X.
+        self._auto_corrections = {}  # {wrong_upper: correct}
+
+        # --- Holdover (anti-flicker) ---
+        # When OCR returns empty but the frame hasn't changed much,
+        # keep emitting the last known result for up to N cycles.
+        self._holdover_frames = holdover_frames
+        self._holdover_remaining = {}  # roi_idx -> int (countdown)
+        self._holdover_results = {}    # roi_idx -> last good texts list
 
         self._ffmpeg_proc = None
         self._decoder_thread = None
@@ -1683,12 +1710,31 @@ class TextDetector:
                 texts = self._detect_roi(roi_img, x, y)
                 # Temporal stabilization: vote across recent frames
                 texts = self._stabilize_results(roi_idx, texts)
-                self._prev_roi_results[roi_idx] = texts
-                all_texts.extend(texts)
+                # Apply name corrections (exact + fuzzy + auto-learned)
+                texts = self._apply_corrections(texts)
+                # Auto-learn corrections from stabilized results
+                self._learn_corrections(roi_idx, texts)
+
+                if texts:
+                    # Got results: update holdover and cache
+                    self._prev_roi_results[roi_idx] = texts
+                    self._holdover_results[roi_idx] = texts
+                    self._holdover_remaining[roi_idx] = self._holdover_frames
+                    all_texts.extend(texts)
+                else:
+                    # Empty result: use holdover to prevent flicker
+                    remaining = self._holdover_remaining.get(roi_idx, 0)
+                    if remaining > 0 and roi_idx in self._holdover_results:
+                        all_texts.extend(self._holdover_results[roi_idx])
+                        self._holdover_remaining[roi_idx] = remaining - 1
+                    else:
+                        # Holdover expired: text is genuinely gone
+                        self._holdover_results.pop(roi_idx, None)
+                        self._prev_roi_results.pop(roi_idx, None)
 
             self._detect_count += 1
 
-            if all_texts and self.on_text_detected:
+            if self.on_text_detected:
                 try:
                     self.on_text_detected(all_texts, frame)
                 except Exception as e:
@@ -1789,6 +1835,107 @@ class TextDetector:
 
         gray = cv2.cvtColor(sharpened, cv2.COLOR_BGR2GRAY)
         return sharpened, gray, scale
+
+    def _apply_corrections(self, texts):
+        """Apply name corrections (exact dict + auto-learned) to OCR results.
+
+        Uses exact match first, then tries fuzzy matching (edit distance <= 2)
+        against the correction dictionary for close misspellings.
+        """
+        if not texts:
+            return texts
+        if not self._name_corrections and not self._auto_corrections:
+            return texts
+
+        corrected = []
+        for det in texts:
+            raw = det["text"]
+            upper = raw.upper()
+
+            # 1) Exact match in user-provided corrections
+            if upper in self._name_corrections:
+                det = {**det, "text": self._name_corrections[upper]}
+                corrected.append(det)
+                continue
+
+            # 2) Exact match in auto-learned corrections
+            if upper in self._auto_corrections:
+                det = {**det, "text": self._auto_corrections[upper]}
+                corrected.append(det)
+                continue
+
+            # 3) Fuzzy match against user corrections (edit distance <= 2)
+            best_match = self._fuzzy_match(upper)
+            if best_match:
+                det = {**det, "text": best_match}
+                corrected.append(det)
+                continue
+
+            corrected.append(det)
+        return corrected
+
+    def _fuzzy_match(self, text_upper):
+        """Find the closest match in the corrections dict (Levenshtein <= 2)."""
+        if len(text_upper) < 3:
+            return None
+        best = None
+        best_dist = 3  # max allowed distance + 1
+        for wrong, correct in self._name_corrections.items():
+            d = self._edit_distance(text_upper, wrong, max_dist=2)
+            if d < best_dist:
+                best_dist = d
+                best = correct
+        return best
+
+    @staticmethod
+    def _edit_distance(a, b, max_dist=2):
+        """Compute Levenshtein distance, returning max_dist+1 if it exceeds max_dist."""
+        la, lb = len(a), len(b)
+        if abs(la - lb) > max_dist:
+            return max_dist + 1
+        # Single-row DP with early termination
+        prev = list(range(lb + 1))
+        for i in range(1, la + 1):
+            curr = [i] + [0] * lb
+            row_min = i
+            for j in range(1, lb + 1):
+                cost = 0 if a[i - 1] == b[j - 1] else 1
+                curr[j] = min(prev[j] + 1, curr[j - 1] + 1, prev[j - 1] + cost)
+                if curr[j] < row_min:
+                    row_min = curr[j]
+            if row_min > max_dist:
+                return max_dist + 1
+            prev = curr
+        return prev[lb]
+
+    def _learn_corrections(self, roi_idx, texts):
+        """Auto-learn corrections from temporal voting patterns.
+
+        When stabilization consistently corrects a text (e.g. 'PLRYER1' always
+        becomes 'PLAYER1' after a few frames), remember that mapping so future
+        occurrences are corrected immediately without waiting for voting.
+        """
+        if not texts or roi_idx not in self._temporal_history:
+            return
+        history = self._temporal_history[roi_idx]
+        if len(history) < self._temporal_window:
+            return
+
+        # Look at the most recent stabilized text vs. what raw OCR returned
+        # in the current frame (last entry in history before stabilization)
+        raw_texts = history[-1]  # most recent raw results
+        for raw_det, stable_det in zip(raw_texts, texts):
+            raw_t = raw_det.get("text", "")
+            stable_t = stable_det.get("text", "")
+            if raw_t and stable_t and raw_t != stable_t:
+                raw_upper = raw_t.upper()
+                if raw_upper not in self._name_corrections:
+                    if raw_upper not in self._auto_corrections:
+                        self._auto_corrections[raw_upper] = stable_t
+                        if self.verbose:
+                            print(f"  [ocr] Auto-learned correction: "
+                                  f"'{raw_t}' -> '{stable_t}'",
+                                  file=sys.stderr)
 
     def _stabilize_results(self, roi_idx, results):
         """Temporal stabilization: vote on text across the last N frames.
@@ -2132,7 +2279,9 @@ class StreamOutput:
                  text_min_confidence=0.7,
                  show_debug_window=False,
                  debug_window_scale=0.5,
-                 ocr_lang=None):
+                 ocr_lang=None,
+                 name_corrections=None,
+                 holdover_frames=10):
         self.host = host
         self.regist_key = regist_key
         self.morning = morning
@@ -2162,6 +2311,8 @@ class StreamOutput:
         self.show_debug_window = show_debug_window
         self.debug_window_scale = debug_window_scale
         self.ocr_lang = ocr_lang
+        self.name_corrections = name_corrections
+        self.holdover_frames = holdover_frames
         self._text_detector = None
 
         self._lib = load_libchiaki(lib_path)
@@ -2456,6 +2607,8 @@ class StreamOutput:
                 window_scale=self.debug_window_scale,
                 ocr_lang=self.ocr_lang,
                 verbose=self.verbose,
+                name_corrections=self.name_corrections,
+                holdover_frames=self.holdover_frames,
             )
             self._text_detector.start()
 
@@ -2908,6 +3061,23 @@ def load_config(path):
 # CLI entry point
 # ---------------------------------------------------------------------------
 
+def _parse_name_corrections(args):
+    """Parse --name-corrections JSON string into a dict."""
+    raw = getattr(args, 'name_corrections', None)
+    if not raw:
+        return None
+    try:
+        corrections = json.loads(raw)
+        if not isinstance(corrections, dict):
+            print("[!] --name-corrections must be a JSON object (dict)",
+                  file=sys.stderr)
+            return None
+        return corrections
+    except json.JSONDecodeError as e:
+        print(f"[!] --name-corrections: invalid JSON: {e}", file=sys.stderr)
+        return None
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="PlayStation Stream Recorder (chiaki-ng Python interface)",
@@ -3047,6 +3217,14 @@ Examples:
     stream_parser.add_argument("--ocr-lang", metavar="LANG", action="append",
                                help="OCR language for EasyOCR (e.g. en, fr). "
                                     "Can be specified multiple times. Default: en.")
+    stream_parser.add_argument("--name-corrections", metavar="JSON",
+                               help="JSON dict of OCR corrections, e.g. "
+                                    "'{\"PLRYER1\":\"PLAYER1\"}'")
+    stream_parser.add_argument("--holdover-frames", type=int, default=10,
+                               metavar="N",
+                               help="Keep showing last detection for N cycles "
+                                    "when OCR returns empty (anti-flicker). "
+                                    "Default: 10.")
 
     args = parser.parse_args()
 
@@ -3303,6 +3481,8 @@ Examples:
             show_debug_window=args.debug_window,
             debug_window_scale=args.debug_scale,
             ocr_lang=getattr(args, 'ocr_lang', None),
+            name_corrections=_parse_name_corrections(args),
+            holdover_frames=getattr(args, 'holdover_frames', 10),
         )
         streamer.stream()
 
