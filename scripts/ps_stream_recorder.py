@@ -1297,10 +1297,16 @@ class TextDetector:
 
         self._ffmpeg_proc = None
         self._decoder_thread = None
+        self._writer_thread = None
         self._stop_event = threading.Event()
         self._frame_count = 0
         self._detect_count = 0
-        self._pipe_lock = threading.Lock()
+        # Lock-free write buffer: video callback drops data here,
+        # a dedicated writer thread picks it up. Only the latest
+        # chunk is kept to avoid backpressure on the video callback.
+        self._write_buf = None
+        self._write_lock = threading.Lock()
+        self._write_event = threading.Event()
 
         # Pre-loaded character templates {char: grayscale_image}
         self._templates = {}
@@ -1358,6 +1364,14 @@ class TextDetector:
         )
 
         self._stop_event.clear()
+
+        # Writer thread: pipes buffered H.264 data to FFmpeg without blocking
+        self._writer_thread = threading.Thread(
+            target=self._writer_loop, daemon=True, name="TextDetector-Writer"
+        )
+        self._writer_thread.start()
+
+        # Reader/detection thread: reads decoded frames and runs OCR
         self._decoder_thread = threading.Thread(
             target=self._detection_loop, daemon=True, name="TextDetector"
         )
@@ -1370,6 +1384,10 @@ class TextDetector:
     def stop(self):
         """Stop the detector and clean up."""
         self._stop_event.set()
+        self._write_event.set()  # unblock writer thread
+        if self._writer_thread:
+            self._writer_thread.join(timeout=3)
+            self._writer_thread = None
         if self._ffmpeg_proc:
             try:
                 self._ffmpeg_proc.stdin.close()
@@ -1389,22 +1407,42 @@ class TextDetector:
                   file=sys.stderr)
 
     def feed(self, h264_data):
-        """Feed raw H.264/H.265 data to the decoder. Non-blocking."""
-        if self._ffmpeg_proc and self._ffmpeg_proc.stdin:
-            with self._pipe_lock:
+        """Feed raw H.264/H.265 data to the decoder. Truly non-blocking.
+
+        Drops data if the writer thread hasn't consumed the previous chunk yet.
+        This prevents backpressure from blocking the video callback.
+        """
+        self._frame_count += 1
+        if self._frame_count == 1:
+            print(f"  [ocr] First NAL unit fed to decoder ({len(h264_data)} bytes)",
+                  file=sys.stderr)
+        # Accumulate data (don't drop partial NAL units, append to buffer)
+        with self._write_lock:
+            if self._write_buf is None:
+                self._write_buf = h264_data
+            else:
+                self._write_buf += h264_data
+        self._write_event.set()
+
+    def _writer_loop(self):
+        """Background thread: writes buffered H.264 data to FFmpeg stdin.
+
+        Runs independently so the video callback is never blocked by pipe I/O.
+        """
+        while not self._stop_event.is_set():
+            self._write_event.wait(timeout=0.1)
+            self._write_event.clear()
+
+            with self._write_lock:
+                data = self._write_buf
+                self._write_buf = None
+
+            if data and self._ffmpeg_proc and self._ffmpeg_proc.stdin:
                 try:
-                    self._ffmpeg_proc.stdin.write(h264_data)
+                    self._ffmpeg_proc.stdin.write(data)
                     self._ffmpeg_proc.stdin.flush()
-                    self._frame_count += 1
-                    if self._frame_count == 1:
-                        print(f"  [ocr] First NAL unit fed to decoder ({len(h264_data)} bytes)",
-                              file=sys.stderr)
-                    elif self._frame_count % 600 == 0:
-                        print(f"  [ocr] Fed {self._frame_count} NAL units to decoder",
-                              file=sys.stderr)
-                except (BrokenPipeError, OSError) as e:
-                    if self._frame_count <= 1:
-                        print(f"  [ocr] Decoder pipe error: {e}", file=sys.stderr)
+                except (BrokenPipeError, OSError):
+                    break
 
     def _detection_loop(self):
         """Background thread: read decoded frames and run text detection."""
