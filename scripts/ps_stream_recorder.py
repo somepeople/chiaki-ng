@@ -1291,6 +1291,10 @@ class StreamOutput:
                 print(f"[+] Created FIFO: {self.fifo_path}", file=sys.stderr)
             elif not os.path.isfifo(self.fifo_path):
                 raise RuntimeError(f"{self.fifo_path} exists but is not a FIFO")
+            # Launch ffplay BEFORE opening the FIFO for writing, because
+            # os.open(O_WRONLY) blocks until a reader connects.
+            if self.play:
+                self._launch_ffplay_on_fifo()
             print(f"[+] Opening FIFO {self.fifo_path} (waiting for reader...)", file=sys.stderr)
             self._video_fd = os.open(self.fifo_path, os.O_WRONLY)
             print(f"[+] FIFO reader connected", file=sys.stderr)
@@ -1380,6 +1384,27 @@ class StreamOutput:
             stderr=None if self.verbose else subprocess.DEVNULL,
         )
         self._video_fd = self._ffmpeg_proc.stdin.fileno()
+
+    def _launch_ffplay_on_fifo(self):
+        """Launch ffplay reading raw H.264/H.265 from the FIFO."""
+        codec_name = "h264" if self.codec == CODEC_H264 else "hevc"
+        ffplay_cmd = [
+            "ffplay",
+            "-fflags", "nobuffer",
+            "-flags", "low_delay",
+            "-framedrop",
+            "-probesize", "32",
+            "-analyzeduration", "0",
+            "-vf", "setpts=0",
+            "-f", codec_name,
+            self.fifo_path,
+        ]
+        print(f"[+] ffplay: {' '.join(ffplay_cmd)}", file=sys.stderr)
+        self._ffplay_proc = subprocess.Popen(
+            ffplay_cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=None if self.verbose else subprocess.DEVNULL,
+        )
 
     def _close_output(self):
         """Close the output destination."""
@@ -1496,10 +1521,9 @@ class StreamOutput:
 
         self._open_output()
 
-        # Launch ffplay AFTER the v4l2 writer has opened the device,
-        # so v4l2loopback advertises VIDEO_CAPTURE capability.
+        # For v4l2 + play: launch ffplay AFTER the writer has opened the device
         if self.play and self.v4l2_device:
-            time.sleep(0.5)  # let FFmpeg writer fully open the device
+            time.sleep(0.5)
             ffplay_cmd = [
                 "ffplay",
                 "-fflags", "nobuffer",
@@ -1516,6 +1540,7 @@ class StreamOutput:
                 stdout=subprocess.DEVNULL,
                 stderr=None if self.verbose else subprocess.DEVNULL,
             )
+        # For FIFO + play: ffplay was already launched in _open_output()
 
         try:
             session_buf = ctypes.create_string_buffer(256 * 1024)
@@ -2037,7 +2062,7 @@ Examples:
                                metavar="DEVICE",
                                help="Enable controller input (auto-detect or specify /dev/input/eventX)")
     stream_parser.add_argument("--play", action="store_true",
-                               help="Launch ffplay with low-latency flags on the v4l2 device (requires --v4l2)")
+                               help="Launch ffplay with low-latency flags (auto-creates FIFO, or uses --v4l2/--fifo)")
 
     args = parser.parse_args()
 
@@ -2235,13 +2260,16 @@ Examples:
         codec = codec_map[args.codec]
 
         # Determine output mode
-        pipe_stdout = not args.fifo and not args.v4l2
         if args.hw_decoder and not args.v4l2:
             print("[!] --hw-decoder only applies to --v4l2 mode", file=sys.stderr)
             sys.exit(1)
-        if args.play and not args.v4l2:
-            print("[!] --play requires --v4l2", file=sys.stderr)
-            sys.exit(1)
+
+        fifo_path = args.fifo
+        # --play without --v4l2/--fifo: auto-create a temp FIFO
+        if args.play and not args.v4l2 and not args.fifo:
+            fifo_path = os.path.join(tempfile.gettempdir(), f"chiaki_play_{os.getpid()}")
+
+        pipe_stdout = not fifo_path and not args.v4l2
 
         streamer = StreamOutput(
             host=host, regist_key=regist_key, morning=morning,
@@ -2249,7 +2277,7 @@ Examples:
             fps=args.fps, bitrate=bitrate, duration=args.duration,
             psn_account_id=psn_account_id, lib_path=args.lib_path,
             verbose=args.verbose,
-            pipe_stdout=pipe_stdout, fifo_path=args.fifo,
+            pipe_stdout=pipe_stdout, fifo_path=fifo_path,
             v4l2_device=args.v4l2, hw_decoder=args.hw_decoder,
             controller_device=args.controller,
             play=args.play,
