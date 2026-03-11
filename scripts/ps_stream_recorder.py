@@ -1790,14 +1790,35 @@ class TextDetector:
         """Detect and recognize text using EasyOCR (neural network)."""
         # Lazy-init: load model on first call (avoids slow startup)
         if self._easyocr_reader is None:
+            gpu = False
             try:
                 import torch
-                gpu = torch.cuda.is_available()
-            except ImportError:
-                gpu = False
+                if torch.cuda.is_available():
+                    # Verify GPU is actually usable (capability check)
+                    cap = torch.cuda.get_device_capability(0)
+                    # PyTorch CUDA builds typically need sm_70+ (Volta and newer)
+                    if cap[0] >= 7:
+                        gpu = True
+                    else:
+                        print(f"[!] EasyOCR: GPU detected (sm_{cap[0]}{cap[1]}) but "
+                              f"CUDA capability too old, falling back to CPU",
+                              file=sys.stderr)
+            except (ImportError, RuntimeError):
+                pass
+
             print(f"[+] EasyOCR: initializing (lang={self.ocr_lang}, gpu={gpu})...",
                   file=sys.stderr)
-            self._easyocr_reader = easyocr.Reader(self.ocr_lang, gpu=gpu, verbose=False)
+            try:
+                self._easyocr_reader = easyocr.Reader(
+                    self.ocr_lang, gpu=gpu, verbose=False)
+            except Exception as e:
+                if gpu:
+                    print(f"[!] EasyOCR: GPU init failed ({e}), retrying on CPU...",
+                          file=sys.stderr)
+                    self._easyocr_reader = easyocr.Reader(
+                        self.ocr_lang, gpu=False, verbose=False)
+                else:
+                    raise
             print("[+] EasyOCR: ready.", file=sys.stderr)
 
         # Preprocess for better accuracy
