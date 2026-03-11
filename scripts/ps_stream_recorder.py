@@ -2332,8 +2332,6 @@ class TextDetector:
         """Detect and recognize text using PaddleOCR (GPU-accelerated)."""
         if self._paddleocr_reader is None:
             lang = self.ocr_lang[0] if self.ocr_lang else "en"
-            # New PaddleOCR API uses device parameter instead of use_gpu
-            # device="gpu:0" for GPU, omit for auto-detect
             try:
                 import paddle
                 has_gpu = paddle.device.is_compiled_with_cuda()
@@ -2342,35 +2340,35 @@ class TextDetector:
 
             print(f"[+] PaddleOCR: initializing (lang={lang}, gpu={has_gpu})...",
                   file=sys.stderr)
-            try:
-                if has_gpu:
-                    self._paddleocr_reader = _PaddleOCR(
-                        lang=lang, device="gpu:0", show_log=False)
-                else:
-                    self._paddleocr_reader = _PaddleOCR(
-                        lang=lang, show_log=False)
-            except TypeError:
-                # Older PaddleOCR without device param
+
+            # PaddleOCR API varies wildly across versions.
+            # Try parameter combos from newest to oldest until one works.
+            param_combos = []
+            if has_gpu:
+                param_combos.append({"lang": lang, "device": "gpu:0"})
+                param_combos.append({"lang": lang, "use_gpu": True, "show_log": False})
+                param_combos.append({"lang": lang, "use_gpu": True})
+            param_combos.append({"lang": lang})
+            param_combos.append({"lang": lang, "show_log": False})
+            param_combos.append({"lang": lang, "use_gpu": False, "show_log": False})
+            param_combos.append({"lang": lang, "use_gpu": False})
+
+            for params in param_combos:
                 try:
-                    self._paddleocr_reader = _PaddleOCR(
-                        lang=lang, use_gpu=has_gpu, show_log=False)
-                except Exception:
-                    self._paddleocr_reader = _PaddleOCR(
-                        lang=lang, show_log=False)
-            except Exception as e:
-                print(f"[!] PaddleOCR: GPU init failed ({e}), retrying without GPU...",
-                      file=sys.stderr)
-                try:
-                    self._paddleocr_reader = _PaddleOCR(
-                        lang=lang, show_log=False)
-                except Exception as e2:
-                    print(f"[!] PaddleOCR: init failed completely ({e2})",
+                    self._paddleocr_reader = _PaddleOCR(**params)
+                    print(f"[+] PaddleOCR: ready (params={params}).",
                           file=sys.stderr)
-                    self._paddleocr_reader = False  # sentinel to stop retrying
+                    break
+                except (TypeError, Exception) as e:
+                    self._paddleocr_reader = None
+                    if self.verbose:
+                        print(f"  [paddleocr] params {params} failed: {e}",
+                              file=sys.stderr)
+
             if self._paddleocr_reader is None:
-                self._paddleocr_reader = False
-            if self._paddleocr_reader:
-                print("[+] PaddleOCR: ready.", file=sys.stderr)
+                print("[!] PaddleOCR: all init attempts failed.",
+                      file=sys.stderr)
+                self._paddleocr_reader = False  # sentinel to stop retrying
 
         if not self._paddleocr_reader:
             return []
