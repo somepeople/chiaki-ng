@@ -1324,7 +1324,10 @@ class TextDetector:
                  lineup_config=None,
                  ocr_engine=None,
                  calibrate_file=None,
-                 corrections_file=None):
+                 corrections_file=None,
+                 collect_crops=None,
+                 rec_model_dir=None,
+                 rec_char_dict_path=None):
         """
         Args:
             width, height: Video resolution.
@@ -1477,6 +1480,19 @@ class TextDetector:
         if corrections_file:
             self._load_corrections_file(corrections_file)
 
+        # --- Crop collection for fine-tuning ---
+        # collect_crops: directory path where ROI crops are saved with
+        # their OCR labels for building a training dataset.
+        self._collect_crops_dir = collect_crops
+        self._crop_counter = 0
+        if collect_crops:
+            os.makedirs(collect_crops, exist_ok=True)
+            os.makedirs(os.path.join(collect_crops, "images"), exist_ok=True)
+
+        # --- Custom PaddleOCR model ---
+        self._rec_model_dir = rec_model_dir
+        self._rec_char_dict_path = rec_char_dict_path
+
         print(f"[+] TextDetector OCR engine: {self._ocr_engine}", file=sys.stderr)
         if self._ocr_engine == self.OCR_ENGINE_MSER:
             print("[!] Warning: MSER mode cannot identify characters (shows '?'). "
@@ -1487,6 +1503,12 @@ class TextDetector:
         if self._corrections_file:
             print(f"[+] Corrections file: {self._corrections_file} "
                   f"({len(self._name_corrections)} entries)",
+                  file=sys.stderr)
+        if self._collect_crops_dir:
+            print(f"[+] Crop collection: saving to {self._collect_crops_dir}/",
+                  file=sys.stderr)
+        if self._rec_model_dir:
+            print(f"[+] Custom rec model: {self._rec_model_dir}",
                   file=sys.stderr)
 
     def _load_templates(self, template_dir):
@@ -1624,6 +1646,29 @@ class TextDetector:
         except OSError as e:
             print(f"[!] Error writing calibration file: {e}", file=sys.stderr)
         self._calibrate_log.clear()
+
+    def _save_crop(self, roi_img, field_name, text, confidence):
+        """Save a ROI crop image for fine-tuning dataset collection.
+
+        Images are saved to collect_crops/images/ and a labels file
+        (rec_gt_train.txt) is appended with the PaddleOCR format:
+            images/crop_00001.png\tLABEL_TEXT
+        """
+        if not self._collect_crops_dir or not text or confidence < 0.5:
+            return
+
+        self._crop_counter += 1
+        img_name = f"crop_{self._crop_counter:06d}.png"
+        img_path = os.path.join(self._collect_crops_dir, "images", img_name)
+        label_path = os.path.join(self._collect_crops_dir, "rec_gt_train.txt")
+
+        try:
+            cv2.imwrite(img_path, roi_img)
+            with open(label_path, "a") as f:
+                f.write(f"images/{img_name}\t{text}\n")
+        except OSError as e:
+            if self.verbose:
+                print(f"  [crop] Error saving crop: {e}", file=sys.stderr)
 
     def start(self):
         """Start the decoder and detection thread.
@@ -2220,6 +2265,8 @@ class TextDetector:
                         self._log_calibration(field_name, raw_text, text,
                                               best["confidence"],
                                               (abs_x, abs_y, fw, fh))
+                        self._save_crop(field_roi, field_name, text,
+                                        best["confidence"])
                         player_result["fields"][field_name] = {
                             "text": text,
                             "confidence": best["confidence"],
@@ -2601,15 +2648,24 @@ class TextDetector:
 
             # PaddleOCR API varies wildly across versions.
             # Try parameter combos from newest to oldest until one works.
+            # If a custom fine-tuned rec model is provided, inject its path.
+            base_params = {"lang": lang}
+            if self._rec_model_dir:
+                base_params["rec_model_dir"] = self._rec_model_dir
+                print(f"[+] PaddleOCR: using custom rec model: "
+                      f"{self._rec_model_dir}", file=sys.stderr)
+            if self._rec_char_dict_path:
+                base_params["rec_char_dict_path"] = self._rec_char_dict_path
+
             param_combos = []
             if has_gpu:
-                param_combos.append({"lang": lang, "device": "gpu:0"})
-                param_combos.append({"lang": lang, "use_gpu": True, "show_log": False})
-                param_combos.append({"lang": lang, "use_gpu": True})
-            param_combos.append({"lang": lang})
-            param_combos.append({"lang": lang, "show_log": False})
-            param_combos.append({"lang": lang, "use_gpu": False, "show_log": False})
-            param_combos.append({"lang": lang, "use_gpu": False})
+                param_combos.append({**base_params, "device": "gpu:0"})
+                param_combos.append({**base_params, "use_gpu": True, "show_log": False})
+                param_combos.append({**base_params, "use_gpu": True})
+            param_combos.append({**base_params})
+            param_combos.append({**base_params, "show_log": False})
+            param_combos.append({**base_params, "use_gpu": False, "show_log": False})
+            param_combos.append({**base_params, "use_gpu": False})
 
             for params in param_combos:
                 try:
@@ -2922,7 +2978,10 @@ class StreamOutput:
                  lineup_config=None,
                  ocr_engine=None,
                  calibrate_file=None,
-                 corrections_file=None):
+                 corrections_file=None,
+                 collect_crops=None,
+                 rec_model_dir=None,
+                 rec_char_dict_path=None):
         self.host = host
         self.regist_key = regist_key
         self.morning = morning
@@ -2958,6 +3017,9 @@ class StreamOutput:
         self.ocr_engine = ocr_engine
         self.calibrate_file = calibrate_file
         self.corrections_file = corrections_file
+        self.collect_crops = collect_crops
+        self.rec_model_dir = rec_model_dir
+        self.rec_char_dict_path = rec_char_dict_path
         self._text_detector = None
 
         self._lib = load_libchiaki(lib_path)
@@ -3258,6 +3320,9 @@ class StreamOutput:
                 ocr_engine=self.ocr_engine,
                 calibrate_file=self.calibrate_file,
                 corrections_file=self.corrections_file,
+                collect_crops=self.collect_crops,
+                rec_model_dir=self.rec_model_dir,
+                rec_char_dict_path=self.rec_char_dict_path,
             )
             self._text_detector.start()
 
@@ -3897,6 +3962,51 @@ Examples:
                                     "are saved back on shutdown. "
                                     "Format: {\"corrections\": {\"WRONG\": \"RIGHT\"}, "
                                     "\"known_values\": {\"field\": [\"val1\", ...]}}")
+    stream_parser.add_argument("--collect-crops", metavar="DIR",
+                               help="Save ROI crop images with OCR labels to DIR/ "
+                                    "for building a PaddleOCR fine-tuning dataset. "
+                                    "Creates DIR/images/ and DIR/rec_gt_train.txt.")
+    stream_parser.add_argument("--rec-model-dir", metavar="DIR",
+                               help="Path to a fine-tuned PaddleOCR recognition "
+                                    "inference model directory (contains "
+                                    "inference.pdmodel + inference.pdiparams).")
+    stream_parser.add_argument("--rec-char-dict-path", metavar="FILE",
+                               help="Path to custom character dictionary file for "
+                                    "fine-tuned PaddleOCR model (one char per line).")
+
+    # --- annotate (review/correct collected crops) ---
+    annotate_parser = subparsers.add_parser(
+        "annotate",
+        help="Review and correct OCR labels on collected crop images "
+             "(interactive terminal UI)")
+    annotate_parser.add_argument("--crops-dir", required=True, metavar="DIR",
+                                 help="Directory with collected crops "
+                                      "(from --collect-crops)")
+    annotate_parser.add_argument("--output", metavar="FILE",
+                                 help="Output label file (default: "
+                                      "DIR/rec_gt_train.txt)")
+
+    # --- train (fine-tune PaddleOCR rec model) ---
+    train_parser = subparsers.add_parser(
+        "train",
+        help="Fine-tune PaddleOCR recognition model on collected/annotated data")
+    train_parser.add_argument("--crops-dir", required=True, metavar="DIR",
+                              help="Directory with annotated crops "
+                                   "(images/ + rec_gt_train.txt)")
+    train_parser.add_argument("--output-model", default="./ocr_model_finetuned",
+                              metavar="DIR",
+                              help="Output directory for the fine-tuned model "
+                                   "(default: ./ocr_model_finetuned)")
+    train_parser.add_argument("--epochs", type=int, default=10,
+                              help="Number of training epochs (default: 10)")
+    train_parser.add_argument("--batch-size", type=int, default=32,
+                              help="Batch size (default: 32)")
+    train_parser.add_argument("--lr", type=float, default=0.0005,
+                              help="Learning rate (default: 0.0005)")
+    train_parser.add_argument("--lang", default="en",
+                              help="Base PaddleOCR language model (default: en)")
+    train_parser.add_argument("--val-split", type=float, default=0.1,
+                              help="Fraction of data for validation (default: 0.1)")
 
     args = parser.parse_args()
 
@@ -4160,8 +4270,361 @@ Examples:
             ocr_engine=getattr(args, 'ocr_engine', None),
             calibrate_file=getattr(args, 'calibrate', None),
             corrections_file=getattr(args, 'corrections_file', None),
+            collect_crops=getattr(args, 'collect_crops', None),
+            rec_model_dir=getattr(args, 'rec_model_dir', None),
+            rec_char_dict_path=getattr(args, 'rec_char_dict_path', None),
         )
         streamer.stream()
+
+    # === ANNOTATE (review/correct OCR labels) ===
+    elif args.command == "annotate":
+        _run_annotate(args)
+
+    # === TRAIN (fine-tune PaddleOCR) ===
+    elif args.command == "train":
+        _run_train(args)
+
+
+def _run_annotate(args):
+    """Interactive terminal tool to review and correct OCR crop labels.
+
+    Reads rec_gt_train.txt from the crops directory, displays each image
+    path and current label, and lets the user accept (Enter), correct
+    (type new text), or skip (s) each entry. Outputs a corrected label
+    file.
+    """
+    crops_dir = args.crops_dir
+    label_file = os.path.join(crops_dir, "rec_gt_train.txt")
+    output_file = args.output or label_file
+
+    if not os.path.isfile(label_file):
+        print(f"[!] Label file not found: {label_file}", file=sys.stderr)
+        sys.exit(1)
+
+    # Read all entries
+    entries = []
+    with open(label_file) as f:
+        for line in f:
+            line = line.rstrip("\n")
+            if "\t" not in line:
+                continue
+            img_path, label = line.split("\t", 1)
+            entries.append({"image": img_path, "label": label})
+
+    if not entries:
+        print("[!] No entries found in label file.", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"[+] Annotate: {len(entries)} crops to review from {crops_dir}")
+    print("    Commands: Enter=accept, type text=correct, s=skip, q=quit\n")
+
+    corrected = []
+    skipped = 0
+    try:
+        for i, entry in enumerate(entries):
+            img_full = os.path.join(crops_dir, entry["image"])
+            exists = os.path.isfile(img_full)
+            status = "" if exists else " [MISSING]"
+            print(f"  [{i + 1}/{len(entries)}]{status} {entry['image']}")
+            print(f"    Current label: \"{entry['label']}\"")
+
+            try:
+                user_input = input("    > ").strip()
+            except EOFError:
+                break
+
+            if user_input.lower() == "q":
+                break
+            elif user_input.lower() == "s":
+                skipped += 1
+                continue
+            elif user_input:
+                entry["label"] = user_input
+
+            corrected.append(entry)
+    except KeyboardInterrupt:
+        print("\n[!] Interrupted.")
+
+    # Write output
+    with open(output_file, "w") as f:
+        for entry in corrected:
+            f.write(f"{entry['image']}\t{entry['label']}\n")
+
+    print(f"\n[+] Done: {len(corrected)} entries written to {output_file} "
+          f"({skipped} skipped)")
+
+
+def _run_train(args):
+    """Fine-tune PaddleOCR recognition model on collected/annotated crops.
+
+    This function:
+    1. Splits the dataset into train/val sets
+    2. Downloads the pretrained model if needed
+    3. Generates a PaddleOCR training config YAML
+    4. Runs training via PaddleOCR tools/train.py
+    5. Exports the inference model for use with --rec-model-dir
+    """
+    crops_dir = args.crops_dir
+    label_file = os.path.join(crops_dir, "rec_gt_train.txt")
+
+    if not os.path.isfile(label_file):
+        print(f"[!] Label file not found: {label_file}", file=sys.stderr)
+        print("    Run with --collect-crops first, then 'annotate' to correct labels.",
+              file=sys.stderr)
+        sys.exit(1)
+
+    # Count entries
+    with open(label_file) as f:
+        lines = [l for l in f if "\t" in l]
+    total = len(lines)
+    if total < 10:
+        print(f"[!] Only {total} samples found. Need at least 10 to train.",
+              file=sys.stderr)
+        sys.exit(1)
+
+    print(f"[+] Training dataset: {total} samples from {crops_dir}")
+
+    # 1. Build character dictionary from labels
+    all_chars = set()
+    for line in lines:
+        _, label = line.strip().split("\t", 1)
+        all_chars.update(label)
+    dict_file = os.path.join(crops_dir, "dict.txt")
+    with open(dict_file, "w") as f:
+        for ch in sorted(all_chars):
+            f.write(ch + "\n")
+    print(f"[+] Character dict: {len(all_chars)} unique chars -> {dict_file}")
+
+    # 2. Split into train/val
+    import random
+    random.shuffle(lines)
+    val_count = max(1, int(total * args.val_split))
+    train_lines = lines[val_count:]
+    val_lines = lines[:val_count]
+
+    train_label = os.path.join(crops_dir, "rec_gt_train_split.txt")
+    val_label = os.path.join(crops_dir, "rec_gt_val.txt")
+    with open(train_label, "w") as f:
+        f.writelines(train_lines)
+    with open(val_label, "w") as f:
+        f.writelines(val_lines)
+    print(f"[+] Split: {len(train_lines)} train + {len(val_lines)} val")
+
+    # 3. Check PaddleOCR repo availability
+    paddleocr_repo = None
+    for candidate in ["./PaddleOCR", os.path.expanduser("~/PaddleOCR"),
+                       "/opt/PaddleOCR"]:
+        if os.path.isdir(os.path.join(candidate, "tools")):
+            paddleocr_repo = candidate
+            break
+
+    if not paddleocr_repo:
+        print("\n[!] PaddleOCR repo not found. Clone it first:")
+        print("    git clone https://github.com/PaddlePaddle/PaddleOCR.git")
+        print("    cd PaddleOCR && pip install -r requirements.txt")
+        print("\n[+] Alternatively, place it in ./PaddleOCR, ~/PaddleOCR, "
+              "or /opt/PaddleOCR")
+        sys.exit(1)
+
+    print(f"[+] PaddleOCR repo: {paddleocr_repo}")
+
+    # 4. Generate training config YAML
+    output_model = os.path.abspath(args.output_model)
+    crops_abs = os.path.abspath(crops_dir)
+    os.makedirs(output_model, exist_ok=True)
+
+    config_yaml = f"""\
+Global:
+  use_gpu: true
+  epoch_num: {args.epochs}
+  save_model_dir: {output_model}/train
+  save_epoch_step: 1
+  eval_batch_step: [0, 100]
+  pretrained_model: null
+  checkpoints: null
+  use_visualdl: false
+  character_dict_path: {os.path.abspath(dict_file)}
+  max_text_length: 50
+  use_space_char: true
+  save_res_path: {output_model}/rec_results.txt
+
+Architecture:
+  model_type: rec
+  algorithm: SVTR_LCNet
+  Transform: null
+  Backbone:
+    name: MobileNetV1Enhance
+    scale: 0.5
+  Head:
+    name: MultiHead
+    head_list:
+      - CTCHead:
+          Neck:
+            name: svtr
+            dims: 64
+            depth: 2
+            hidden_dims: 120
+            use_guide: true
+          Head:
+            fc_decay: 0.00001
+      - SARHead:
+          enc_dim: 512
+          max_text_length: 50
+
+Loss:
+  name: MultiLoss
+  loss_config_list:
+    - CTCLoss: null
+    - SARLoss: null
+
+Optimizer:
+  name: Adam
+  beta1: 0.9
+  beta2: 0.999
+  lr:
+    name: Cosine
+    learning_rate: {args.lr}
+    warmup_epoch: 2
+  regularizer:
+    name: L2
+    factor: 0.00001
+
+PostProcess:
+  name: CTCLabelDecode
+
+Metric:
+  name: RecMetric
+  main_indicator: acc
+
+Train:
+  dataset:
+    name: SimpleDataSet
+    data_dir: {crops_abs}
+    label_file_list:
+      - {os.path.abspath(train_label)}
+    transforms:
+      - DecodeImage:
+          img_mode: BGR
+          channel_first: false
+      - RecAug: null
+      - MultiLabelEncode: null
+      - RecResizeImg:
+          image_shape: [3, 48, 320]
+      - KeepKeys:
+          keep_keys: ["image", "label_ctc", "label_sar", "length", "valid_ratio"]
+  loader:
+    shuffle: true
+    batch_size_per_card: {args.batch_size}
+    drop_last: true
+    num_workers: 4
+
+Eval:
+  dataset:
+    name: SimpleDataSet
+    data_dir: {crops_abs}
+    label_file_list:
+      - {os.path.abspath(val_label)}
+    transforms:
+      - DecodeImage:
+          img_mode: BGR
+          channel_first: false
+      - MultiLabelEncode: null
+      - RecResizeImg:
+          image_shape: [3, 48, 320]
+      - KeepKeys:
+          keep_keys: ["image", "label_ctc", "label_sar", "length", "valid_ratio"]
+  loader:
+    shuffle: false
+    batch_size_per_card: {args.batch_size}
+    drop_last: false
+    num_workers: 4
+"""
+    config_path = os.path.join(output_model, "rec_finetune.yml")
+    with open(config_path, "w") as f:
+        f.write(config_yaml)
+    print(f"[+] Config written: {config_path}")
+
+    # 5. Download pretrained model if needed
+    pretrained_dir = os.path.join(output_model, "pretrained")
+    os.makedirs(pretrained_dir, exist_ok=True)
+    pretrained_model = os.path.join(pretrained_dir, "best_accuracy")
+
+    if not os.path.exists(pretrained_model + ".pdparams"):
+        print("[+] Downloading PP-OCRv3 English pretrained rec model...")
+        import subprocess
+        tar_url = ("https://paddleocr.bj.bcebos.com/PP-OCRv3/english/"
+                   "en_PP-OCRv3_rec_train.tar")
+        tar_path = os.path.join(pretrained_dir, "en_PP-OCRv3_rec_train.tar")
+        try:
+            subprocess.run(["wget", "-q", "-O", tar_path, tar_url], check=True)
+            subprocess.run(["tar", "xf", tar_path, "-C", pretrained_dir],
+                          check=True)
+            # Move extracted files up
+            extracted = os.path.join(pretrained_dir, "en_PP-OCRv3_rec_train")
+            if os.path.isdir(extracted):
+                for f in os.listdir(extracted):
+                    os.rename(os.path.join(extracted, f),
+                              os.path.join(pretrained_dir, f))
+                os.rmdir(extracted)
+            os.remove(tar_path)
+            print("[+] Pretrained model downloaded.")
+        except (subprocess.CalledProcessError, OSError) as e:
+            print(f"[!] Failed to download pretrained model: {e}",
+                  file=sys.stderr)
+            print("    Download manually from:", file=sys.stderr)
+            print(f"    {tar_url}", file=sys.stderr)
+            sys.exit(1)
+    else:
+        print(f"[+] Pretrained model found: {pretrained_dir}")
+
+    # 6. Run training
+    import subprocess
+    train_cmd = [
+        sys.executable,
+        os.path.join(paddleocr_repo, "tools", "train.py"),
+        "-c", config_path,
+        "-o", f"Global.pretrained_model={pretrained_model}",
+    ]
+    print(f"\n[+] Starting training ({args.epochs} epochs, "
+          f"batch_size={args.batch_size}, lr={args.lr})...")
+    print(f"    Command: {' '.join(train_cmd)}\n")
+
+    ret = subprocess.run(train_cmd, cwd=paddleocr_repo)
+    if ret.returncode != 0:
+        print(f"\n[!] Training failed (exit code {ret.returncode})",
+              file=sys.stderr)
+        sys.exit(1)
+
+    # 7. Export inference model
+    print("\n[+] Exporting inference model...")
+    best_model = os.path.join(output_model, "train", "best_accuracy")
+    inference_dir = os.path.join(output_model, "inference")
+    export_cmd = [
+        sys.executable,
+        os.path.join(paddleocr_repo, "tools", "export_model.py"),
+        "-c", config_path,
+        "-o", f"Global.pretrained_model={best_model}",
+        f"Global.save_inference_dir={inference_dir}",
+    ]
+    ret = subprocess.run(export_cmd, cwd=paddleocr_repo)
+    if ret.returncode != 0:
+        print(f"\n[!] Export failed (exit code {ret.returncode})",
+              file=sys.stderr)
+        sys.exit(1)
+
+    # Copy dict file next to inference model
+    import shutil
+    shutil.copy2(dict_file, os.path.join(inference_dir, "dict.txt"))
+
+    print(f"\n{'='*60}")
+    print(f"[+] Fine-tuning complete!")
+    print(f"    Model:      {inference_dir}/")
+    print(f"    Dict:       {inference_dir}/dict.txt")
+    print(f"    Samples:    {len(train_lines)} train + {len(val_lines)} val")
+    print(f"\n    Use with:")
+    print(f"    --rec-model-dir {inference_dir} "
+          f"--rec-char-dict-path {inference_dir}/dict.txt")
+    print(f"{'='*60}")
 
 
 if __name__ == "__main__":
