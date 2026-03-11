@@ -1773,6 +1773,14 @@ class TextDetector:
                     lineup_data = self._detect_lineup(frame)
                     # Flatten lineup results into all_texts for the callback
                     for team_data in lineup_data.get("teams", {}).values():
+                        if team_data.get("name") and team_data.get("name_bbox"):
+                            all_texts.append({
+                                "text": team_data["name"],
+                                "bbox": team_data["name_bbox"],
+                                "confidence": 1.0,
+                                "field": "team_name",
+                                "team": team_data.get("label", ""),
+                            })
                         for player in team_data.get("players", []):
                             for fname, fdata in player.get("fields", {}).items():
                                 if fdata["text"]:
@@ -1942,8 +1950,27 @@ class TextDetector:
         for team_key, team_cfg in cfg.get("teams", {}).items():
             team_result = {
                 "label": team_cfg.get("label", team_key),
+                "name": None,
+                "name_bbox": None,
                 "players": [],
             }
+
+            # OCR team name ROI if configured
+            name_cfg = team_cfg.get("name")
+            if name_cfg:
+                nx, ny = name_cfg["x"], name_cfg["y"]
+                nw, nh = name_cfg["width"], name_cfg["height"]
+                nx = max(0, min(nx, self.width - 1))
+                ny = max(0, min(ny, self.height - 1))
+                nw = min(nw, self.width - nx)
+                nh = min(nh, self.height - ny)
+                name_roi = frame[ny:ny + nh, nx:nx + nw]
+                if name_roi.size > 0:
+                    name_texts = self._detect_roi(name_roi, nx, ny)
+                    if name_texts:
+                        team_result["name"] = " ".join(
+                            t["text"] for t in name_texts)
+                    team_result["name_bbox"] = (nx, ny, nw, nh)
             for player in team_cfg.get("players", []):
                 px, py = player["x"], player["y"]
                 pw, ph = player["width"], player["height"]
@@ -2043,30 +2070,20 @@ class TextDetector:
         for team_key, team_data in lineup_data.get("teams", {}).items():
             players = team_data.get("players", [])
 
-            # Draw team label — position from config or auto-centered
-            label = team_data.get("label", team_key)
-            team_cfg = cfg.get("teams", {}).get(team_key, {})
-            font = cv2.FONT_HERSHEY_SIMPLEX
-            font_scale = 0.7
-            thickness = 2
-            if "label_x" in team_cfg and "label_y" in team_cfg:
-                tx = team_cfg["label_x"]
-                ty = team_cfg["label_y"]
-            elif players:
-                # Fallback: center above the team's player group
-                min_x = min(p["bbox"][0] for p in players)
-                max_x = max(p["bbox"][0] + p["bbox"][2] for p in players)
-                min_y = min(p["bbox"][1] for p in players)
-                (tw, _th), _ = cv2.getTextSize(label, font, font_scale, thickness)
-                tx = min_x + (max_x - min_x - tw) // 2
-                ty = min_y - 10
-            else:
-                tx = None
-            if tx is not None:
+            # Draw team name ROI box + detected text
+            name_bbox = team_data.get("name_bbox")
+            if name_bbox:
+                nx, ny, nw, nh = name_bbox
+                cv2.rectangle(display, (nx, ny), (nx + nw, ny + nh),
+                              (0, 255, 255), 2)
+                label = team_data.get("name") or team_data.get("label", team_key)
+                font = cv2.FONT_HERSHEY_SIMPLEX
+                font_scale = 0.6
+                thickness = 2
                 (tw, th), _ = cv2.getTextSize(label, font, font_scale, thickness)
-                cv2.rectangle(display, (tx - 4, ty - th - 4),
-                              (tx + tw + 4, ty + 4), (0, 0, 0), -1)
-                cv2.putText(display, label, (tx, ty), font,
+                cv2.rectangle(display, (nx, ny - th - 8),
+                              (nx + tw + 8, ny), (0, 0, 0), -1)
+                cv2.putText(display, label, (nx + 4, ny - 4), font,
                             font_scale, (0, 255, 255), thickness)
 
             for player in players:

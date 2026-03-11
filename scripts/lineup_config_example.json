@@ -9,8 +9,7 @@
   "teams": {
     "team_a": {
       "label": "TEAM A",
-      "label_x": 380,
-      "label_y": 190,
+      "name": { "x": 300, "y": 160, "width": 200, "height": 30 },
       "players": [
         {
           "x": 100,
@@ -84,8 +83,7 @@
     },
     "team_b": {
       "label": "TEAM B",
-      "label_x": 1330,
-      "label_y": 190,
+      "name": { "x": 1250, "y": 160, "width": 200, "height": 30 },
       "players": [
         {
           "x": 1000,
