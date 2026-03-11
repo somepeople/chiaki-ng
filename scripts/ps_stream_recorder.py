@@ -1397,14 +1397,21 @@ class StreamOutput:
             "-analyzeduration", "0",
             "-vf", "setpts=0",
             "-f", codec_name,
-            self.fifo_path,
+            "-i", self.fifo_path,
         ]
         print(f"[+] ffplay: {' '.join(ffplay_cmd)}", file=sys.stderr)
         self._ffplay_proc = subprocess.Popen(
             ffplay_cmd,
             stdout=subprocess.DEVNULL,
-            stderr=None if self.verbose else subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
         )
+        # Give ffplay a moment to start, then check it didn't crash
+        time.sleep(0.3)
+        ret = self._ffplay_proc.poll()
+        if ret is not None:
+            stderr_out = self._ffplay_proc.stderr.read().decode(errors="replace")
+            self._ffplay_proc = None
+            raise RuntimeError(f"ffplay exited immediately (code {ret}):\n{stderr_out}")
 
     def _close_output(self):
         """Close the output destination."""
@@ -1644,6 +1651,8 @@ class StreamOutput:
             if self._ffplay_proc:
                 self._ffplay_proc.terminate()
                 try:
+                    if self._ffplay_proc.stderr:
+                        self._ffplay_proc.stderr.close()
                     self._ffplay_proc.wait(timeout=5)
                 except subprocess.TimeoutExpired:
                     self._ffplay_proc.kill()
