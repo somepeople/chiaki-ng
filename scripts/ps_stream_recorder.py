@@ -1296,7 +1296,8 @@ class TextDetector:
                  verbose=False,
                  name_corrections=None,
                  holdover_frames=10,
-                 lineup_config=None):
+                 lineup_config=None,
+                 ocr_engine=None):
         """
         Args:
             width, height: Video resolution.
@@ -1414,8 +1415,10 @@ class TextDetector:
         # EasyOCR reader (lazy-initialized on first use to avoid slow startup)
         self._easyocr_reader = None
 
-        # Determine active OCR engine
-        if self._templates:
+        # Determine active OCR engine (CLI override or auto-detect)
+        if ocr_engine:
+            self._ocr_engine = ocr_engine
+        elif self._templates:
             self._ocr_engine = self.OCR_ENGINE_TEMPLATE
         elif _easyocr_available:
             self._ocr_engine = self.OCR_ENGINE_EASYOCR
@@ -2574,7 +2577,8 @@ class StreamOutput:
                  ocr_lang=None,
                  name_corrections=None,
                  holdover_frames=10,
-                 lineup_config=None):
+                 lineup_config=None,
+                 ocr_engine=None):
         self.host = host
         self.regist_key = regist_key
         self.morning = morning
@@ -2607,6 +2611,7 @@ class StreamOutput:
         self.name_corrections = name_corrections
         self.holdover_frames = holdover_frames
         self.lineup_config = lineup_config
+        self.ocr_engine = ocr_engine
         self._text_detector = None
 
         self._lib = load_libchiaki(lib_path)
@@ -2904,6 +2909,7 @@ class StreamOutput:
                 name_corrections=self.name_corrections,
                 holdover_frames=self.holdover_frames,
                 lineup_config=self.lineup_config,
+                ocr_engine=self.ocr_engine,
             )
             self._text_detector.start()
 
@@ -3512,6 +3518,10 @@ Examples:
                                help="Show OpenCV debug window with video and detection overlays (press 'q' to quit)")
     stream_parser.add_argument("--debug-scale", type=float, default=0.5,
                                help="Scale factor for debug window (default: 0.5 = half size)")
+    stream_parser.add_argument("--ocr-engine",
+                               choices=["easyocr", "tesseract"],
+                               help="Force OCR engine instead of auto-detecting. "
+                                    "Default: auto (easyocr > tesseract > mser).")
     stream_parser.add_argument("--ocr-lang", metavar="LANG", action="append",
                                help="OCR language for EasyOCR (e.g. en, fr). "
                                     "Can be specified multiple times. Default: en.")
@@ -3789,6 +3799,7 @@ Examples:
             name_corrections=_parse_name_corrections(args),
             holdover_frames=getattr(args, 'holdover_frames', 10),
             lineup_config=getattr(args, 'lineup_config', None),
+            ocr_engine=getattr(args, 'ocr_engine', None),
         )
         streamer.stream()
 
