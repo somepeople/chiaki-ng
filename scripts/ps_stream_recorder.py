@@ -1877,59 +1877,82 @@ class TextDetector:
             print(f"  [ocr] ONNX session failed: {e}", file=sys.stderr)
             self._upscaler = None
 
-    def _esrgan_enhance(self, img_bgr):
-        """Run Real-ESRGAN 4x upscale via ONNX Runtime.
+    def _esrgan_run_tile(self, tile_bgr):
+        """Run a single 128x128 tile through the ONNX model → 512x512.
 
-        The ONNX model expects a fixed 128x128 input.  We pad the ROI
-        to 128x128, run inference (→512x512), then crop back to the
-        original aspect ratio at 4x scale.
+        Args:
+            tile_bgr: numpy array (128, 128, 3) BGR uint8
+        Returns:
+            numpy array (512, 512, 3) BGR uint8
+        """
+        img_rgb = cv2.cvtColor(tile_bgr, cv2.COLOR_BGR2RGB)
+        img = img_rgb.astype(np.float32) / 255.0
+        img = np.transpose(img, (2, 0, 1))
+        img = np.expand_dims(img, axis=0)
+
+        input_name = self._upscaler.get_inputs()[0].name
+        output = self._upscaler.run(None, {input_name: img})[0]
+
+        output = np.squeeze(output, axis=0)
+        output = np.transpose(output, (1, 2, 0))
+        output = np.clip(output * 255.0, 0, 255).astype(np.uint8)
+        return cv2.cvtColor(output, cv2.COLOR_RGB2BGR)
+
+    def _esrgan_enhance(self, img_bgr):
+        """Run Real-ESRGAN 4x upscale via ONNX Runtime with tiling.
+
+        The ONNX model expects a fixed 128x128 input.  We split the
+        image into overlapping 128x128 tiles, upscale each to 512x512,
+        blend overlapping edges, and stitch the result.  This avoids
+        downscaling wide text ROIs (which destroys small letter detail).
 
         Args:
             img_bgr: numpy array (H, W, 3) BGR uint8
         Returns:
             numpy array (H*4, W*4, 3) BGR uint8
         """
+        tile = self._esrgan_input_size   # 128
+        out_tile = tile * 4               # 512
+        overlap = 8                       # overlap in input pixels
+        out_overlap = overlap * 4         # 32 in output pixels
         h, w = img_bgr.shape[:2]
-        input_size = self._esrgan_input_size
 
-        # Pad to input_size x input_size (letterbox, black borders)
-        scale_fit = min(input_size / w, input_size / h)
-        new_w = int(w * scale_fit)
-        new_h = int(h * scale_fit)
-        resized = cv2.resize(img_bgr, (new_w, new_h),
-                             interpolation=cv2.INTER_LANCZOS4)
-        padded = np.zeros((input_size, input_size, 3), dtype=np.uint8)
-        y_off = (input_size - new_h) // 2
-        x_off = (input_size - new_w) // 2
-        padded[y_off:y_off + new_h, x_off:x_off + new_w] = resized
+        # Pad image so dimensions are multiples of (tile - overlap)
+        step = tile - overlap  # 120
+        pad_h = (step - (h % step)) % step
+        pad_w = (step - (w % step)) % step
+        padded = cv2.copyMakeBorder(img_bgr, 0, pad_h, 0, pad_w,
+                                    cv2.BORDER_REFLECT_101)
+        ph, pw = padded.shape[:2]
 
-        # Preprocess: BGR→RGB, uint8→float32 [0,1], HWC→NCHW
-        img_rgb = cv2.cvtColor(padded, cv2.COLOR_BGR2RGB)
-        img = img_rgb.astype(np.float32) / 255.0
-        img = np.transpose(img, (2, 0, 1))  # HWC → CHW
-        img = np.expand_dims(img, axis=0)     # CHW → NCHW
+        # Allocate output + weight buffer for blending
+        out_h, out_w = ph * 4, pw * 4
+        result = np.zeros((out_h, out_w, 3), dtype=np.float32)
+        weight = np.zeros((out_h, out_w, 1), dtype=np.float32)
 
-        # Inference
-        input_name = self._upscaler.get_inputs()[0].name
-        output = self._upscaler.run(None, {input_name: img})[0]
+        # Build 1-D ramp for blending overlapping edges
+        ramp = np.ones(out_tile, dtype=np.float32)
+        if out_overlap > 0:
+            ramp[:out_overlap] = np.linspace(0, 1, out_overlap)
+            ramp[-out_overlap:] = np.linspace(1, 0, out_overlap)
+        # 2-D weight map: outer product of horizontal and vertical ramps
+        w_map = (ramp[:, None] * ramp[None, :])[:, :, None]  # (512,512,1)
 
-        # Postprocess: NCHW→HWC, clip [0,1], float32→uint8, RGB→BGR
-        output = np.squeeze(output, axis=0)        # NCHW → CHW
-        output = np.transpose(output, (1, 2, 0))   # CHW → HWC
-        output = np.clip(output * 255.0, 0, 255).astype(np.uint8)
-        result = cv2.cvtColor(output, cv2.COLOR_RGB2BGR)
+        for y in range(0, ph - tile + 1, step):
+            for x in range(0, pw - tile + 1, step):
+                patch = padded[y:y + tile, x:x + tile]
+                out_patch = self._esrgan_run_tile(patch).astype(np.float32)
 
-        # Crop back to original aspect ratio at 4x scale
-        out_scale = self._esrgan_input_size * 4 // input_size  # = 4
-        crop_y = y_off * out_scale
-        crop_x = x_off * out_scale
-        crop_h = new_h * out_scale
-        crop_w = new_w * out_scale
-        cropped = result[crop_y:crop_y + crop_h, crop_x:crop_x + crop_w]
+                oy, ox = y * 4, x * 4
+                result[oy:oy + out_tile, ox:ox + out_tile] += out_patch * w_map
+                weight[oy:oy + out_tile, ox:ox + out_tile] += w_map
 
-        # Resize to exact 4x of original dimensions
-        return cv2.resize(cropped, (w * 4, h * 4),
-                          interpolation=cv2.INTER_LANCZOS4)
+        # Normalize by accumulated weight and convert back to uint8
+        weight = np.maximum(weight, 1e-6)
+        result = np.clip(result / weight, 0, 255).astype(np.uint8)
+
+        # Crop to exact 4x of original dimensions
+        return result[:h * 4, :w * 4]
 
     def _preprocess_roi(self, roi_img):
         """Preprocessing pipeline with neural super-resolution upscaling.
