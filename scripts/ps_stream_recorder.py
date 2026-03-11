@@ -2267,6 +2267,20 @@ class TextDetector:
                     "fields": {},
                 }
 
+                # Pre-detect "ready" status so we can adjust
+                # gamertag crop coordinates when READY is displayed.
+                player_is_ready = False
+                for fn, fb in player.get("fields", {}).items():
+                    if fb.get("type") == "ready":
+                        rx = max(0, min(fb["x"], pw - 1))
+                        ry = max(0, min(fb["y"], ph - 1))
+                        rw = min(fb["width"], pw - rx)
+                        rh = min(fb["height"], ph - ry)
+                        ready_roi = player_roi[ry:ry + rh, rx:rx + rw]
+                        if ready_roi.size > 0:
+                            player_is_ready = self._detect_ready_color(ready_roi)
+                        break
+
                 # OCR each sub-field at its relative position
                 for field_name, fbox in player.get("fields", {}).items():
                     fx, fy = fbox["x"], fbox["y"]
@@ -2287,14 +2301,26 @@ class TextDetector:
 
                     # "ready" fields use color detection instead of OCR
                     if fbox.get("type") == "ready":
-                        is_ready = self._detect_ready_color(field_roi)
                         player_result["fields"][field_name] = {
-                            "text": "READY" if is_ready else "",
-                            "confidence": 1.0 if is_ready else 0.0,
+                            "text": "READY" if player_is_ready else "",
+                            "confidence": 1.0 if player_is_ready else 0.0,
                             "bbox": (abs_x, abs_y, fw, fh),
-                            "ready": is_ready,
+                            "ready": player_is_ready,
                         }
                         continue
+
+                    # When player is READY, shift gamertag x by 58px
+                    # to avoid capturing the "READY" overlay text.
+                    if field_name == "gamertag" and player_is_ready:
+                        shift = 58
+                        fx = fx + shift
+                        fw = fw - shift
+                        if fw <= 0:
+                            continue
+                        field_roi = player_roi[fy:fy + fh, fx:fx + fw]
+                        if field_roi.size == 0:
+                            continue
+                        abs_x = px + fx
 
                     # OCR this small field region
                     texts = self._detect_roi(field_roi, abs_x, abs_y)
