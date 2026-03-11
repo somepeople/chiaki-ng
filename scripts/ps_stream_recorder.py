@@ -1558,7 +1558,10 @@ class TextDetector:
                 self._ffmpeg_proc.kill()
             self._ffmpeg_proc = None
         if hasattr(self, '_av_codec_ctx') and self._av_codec_ctx:
-            self._av_codec_ctx.close()
+            try:
+                self._av_codec_ctx.close()
+            except AttributeError:
+                pass  # PyAV VideoCodecContext may not have close()
             self._av_codec_ctx = None
         if self._reader_thread:
             self._reader_thread.join(timeout=3)
@@ -2338,9 +2341,14 @@ class TextDetector:
             lang = self.ocr_lang[0] if self.ocr_lang else "en"
             print(f"[+] PaddleOCR: initializing (lang={lang}, gpu={use_gpu})...",
                   file=sys.stderr)
-            self._paddleocr_reader = _PaddleOCR(
-                use_angle_cls=False, lang=lang, use_gpu=use_gpu,
-                show_log=False)
+            try:
+                self._paddleocr_reader = _PaddleOCR(
+                    lang=lang, use_gpu=use_gpu, show_log=False)
+            except Exception as e:
+                print(f"[!] PaddleOCR: init failed ({e}), falling back to CPU...",
+                      file=sys.stderr)
+                self._paddleocr_reader = _PaddleOCR(
+                    lang=lang, use_gpu=False, show_log=False)
             print("[+] PaddleOCR: ready.", file=sys.stderr)
 
         result = self._paddleocr_reader.ocr(roi_img, cls=False)
