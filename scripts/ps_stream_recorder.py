@@ -2191,6 +2191,9 @@ class TextDetector:
                 best_conf = max(t["confidence"] for t in mode_texts)
                 self._log_calibration("mode", raw_mode, result["mode"],
                                       best_conf, (mx, my, mw, mh))
+                self._save_crop(mode_roi, "mode", result["mode"],
+                                best_conf, team_key="_global",
+                                player_idx=0)
 
         # Detect each team
         for team_key, team_cfg in cfg.get("teams", {}).items():
@@ -2216,6 +2219,10 @@ class TextDetector:
                     if name_texts:
                         team_result["name"] = " ".join(
                             t["text"] for t in name_texts)
+                        best_conf = max(t["confidence"] for t in name_texts)
+                        self._save_crop(name_roi, "team_name",
+                                        team_result["name"], best_conf,
+                                        team_key=team_key, player_idx=0)
                     team_result["name_bbox"] = (nx, ny, nw, nh)
             for player_idx, player in enumerate(team_cfg.get("players", [])):
                 px, py = player["x"], player["y"]
