@@ -1707,51 +1707,52 @@ class TextDetector:
             if frame is None:
                 continue
 
-            # Run detection on each ROI
+            # Run detection on each ROI (skip when lineup config is active)
             all_texts = []
-            for roi_idx, roi in enumerate(self.rois):
-                x = int(roi[0] * self.width)
-                y = int(roi[1] * self.height)
-                w = int(roi[2] * self.width)
-                h = int(roi[3] * self.height)
-                roi_img = frame[y:y+h, x:x+w]
+            if self._lineup_config is None:
+                for roi_idx, roi in enumerate(self.rois):
+                    x = int(roi[0] * self.width)
+                    y = int(roi[1] * self.height)
+                    w = int(roi[2] * self.width)
+                    h = int(roi[3] * self.height)
+                    roi_img = frame[y:y+h, x:x+w]
 
-                # Frame-diff cache: skip OCR if this ROI hasn't changed
-                gray_roi = cv2.cvtColor(roi_img, cv2.COLOR_BGR2GRAY)
-                if roi_idx in self._prev_roi_grays:
-                    diff = cv2.absdiff(gray_roi, self._prev_roi_grays[roi_idx])
-                    mean_diff = float(np.mean(diff))
-                    if mean_diff < self._roi_diff_threshold:
-                        # ROI unchanged, reuse cached results
-                        if roi_idx in self._prev_roi_results:
-                            all_texts.extend(self._prev_roi_results[roi_idx])
-                        continue
-                self._prev_roi_grays[roi_idx] = gray_roi
+                    # Frame-diff cache: skip OCR if this ROI hasn't changed
+                    gray_roi = cv2.cvtColor(roi_img, cv2.COLOR_BGR2GRAY)
+                    if roi_idx in self._prev_roi_grays:
+                        diff = cv2.absdiff(gray_roi, self._prev_roi_grays[roi_idx])
+                        mean_diff = float(np.mean(diff))
+                        if mean_diff < self._roi_diff_threshold:
+                            # ROI unchanged, reuse cached results
+                            if roi_idx in self._prev_roi_results:
+                                all_texts.extend(self._prev_roi_results[roi_idx])
+                            continue
+                    self._prev_roi_grays[roi_idx] = gray_roi
 
-                texts = self._detect_roi(roi_img, x, y)
-                # Temporal stabilization: vote across recent frames
-                texts = self._stabilize_results(roi_idx, texts)
-                # Apply name corrections (exact + fuzzy + auto-learned)
-                texts = self._apply_corrections(texts)
-                # Auto-learn corrections from stabilized results
-                self._learn_corrections(roi_idx, texts)
+                    texts = self._detect_roi(roi_img, x, y)
+                    # Temporal stabilization: vote across recent frames
+                    texts = self._stabilize_results(roi_idx, texts)
+                    # Apply name corrections (exact + fuzzy + auto-learned)
+                    texts = self._apply_corrections(texts)
+                    # Auto-learn corrections from stabilized results
+                    self._learn_corrections(roi_idx, texts)
 
-                if texts:
-                    # Got results: update holdover and cache
-                    self._prev_roi_results[roi_idx] = texts
-                    self._holdover_results[roi_idx] = texts
-                    self._holdover_remaining[roi_idx] = self._holdover_frames
-                    all_texts.extend(texts)
-                else:
-                    # Empty result: use holdover to prevent flicker
-                    remaining = self._holdover_remaining.get(roi_idx, 0)
-                    if remaining > 0 and roi_idx in self._holdover_results:
-                        all_texts.extend(self._holdover_results[roi_idx])
-                        self._holdover_remaining[roi_idx] = remaining - 1
+                    if texts:
+                        # Got results: update holdover and cache
+                        self._prev_roi_results[roi_idx] = texts
+                        self._holdover_results[roi_idx] = texts
+                        self._holdover_remaining[roi_idx] = self._holdover_frames
+                        all_texts.extend(texts)
                     else:
-                        # Holdover expired: text is genuinely gone
-                        self._holdover_results.pop(roi_idx, None)
-                        self._prev_roi_results.pop(roi_idx, None)
+                        # Empty result: use holdover to prevent flicker
+                        remaining = self._holdover_remaining.get(roi_idx, 0)
+                        if remaining > 0 and roi_idx in self._holdover_results:
+                            all_texts.extend(self._holdover_results[roi_idx])
+                            self._holdover_remaining[roi_idx] = remaining - 1
+                        else:
+                            # Holdover expired: text is genuinely gone
+                            self._holdover_results.pop(roi_idx, None)
+                            self._prev_roi_results.pop(roi_idx, None)
 
             # Lineup detection (structured player-card ROIs)
             lineup_data = None
