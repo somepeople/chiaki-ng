@@ -1669,15 +1669,14 @@ class TextDetector:
                    team_key="unknown", player_idx=0):
         """Save a ROI crop image for fine-tuning dataset collection.
 
-        Images are organized into subdirectories by team, player slot,
-        and field type for easy browsing and selective annotation:
+        All crop images are stored in a flat ``images/`` directory:
 
-            images/<team_key>/<player_idx>/<field_name>/crop_000001.png
+            images/crop_000001.png
 
         The label file (rec_gt_train.txt) uses relative paths so the
         dataset stays portable:
 
-            images/team_a/0/gamertag/crop_000001.png\tPlayerName
+            images/crop_000001.png\tPlayerName
 
         Deduplication: crops with the same (field, team, player, text,
         perceptual-hash) are saved only once, which massively reduces
@@ -1694,9 +1693,7 @@ class TextDetector:
         self._crop_seen.add(dedup_key)
 
         self._crop_counter += 1
-        # Sanitize team_key for filesystem safety
-        safe_team = team_key.replace("/", "_").replace("\\", "_")
-        sub_dir = os.path.join("images", safe_team, str(player_idx), field_name)
+        sub_dir = "images"
         full_dir = os.path.join(self._collect_crops_dir, sub_dir)
         os.makedirs(full_dir, exist_ok=True)
 
