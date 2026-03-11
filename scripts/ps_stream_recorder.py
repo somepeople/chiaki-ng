@@ -4065,6 +4065,8 @@ Examples:
                               help="Base PaddleOCR language model (default: en)")
     train_parser.add_argument("--val-split", type=float, default=0.1,
                               help="Fraction of data for validation (default: 0.1)")
+    train_parser.add_argument("--cpu", action="store_true",
+                              help="Force CPU training (avoids CUDA segfaults)")
 
     args = parser.parse_args()
 
@@ -4516,9 +4518,10 @@ def _run_train(args):
     crops_abs = os.path.abspath(crops_dir)
     os.makedirs(output_model, exist_ok=True)
 
+    use_gpu = "false" if args.cpu else "true"
     config_yaml = f"""\
 Global:
-  use_gpu: true
+  use_gpu: {use_gpu}
   epoch_num: {args.epochs}
   save_model_dir: {output_model}/train
   save_epoch_step: 1
