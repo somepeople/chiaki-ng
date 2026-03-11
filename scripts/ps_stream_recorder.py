@@ -4662,9 +4662,10 @@ Eval:
 
     # 6. Run training
     import subprocess
+    paddleocr_abs = os.path.abspath(paddleocr_repo)
     train_cmd = [
         sys.executable,
-        os.path.join(paddleocr_repo, "tools", "train.py"),
+        os.path.join(paddleocr_abs, "tools", "train.py"),
         "-c", config_path,
         "-o", f"Global.pretrained_model={pretrained_model}",
     ]
@@ -4672,7 +4673,7 @@ Eval:
           f"batch_size={args.batch_size}, lr={args.lr})...")
     print(f"    Command: {' '.join(train_cmd)}\n")
 
-    ret = subprocess.run(train_cmd, cwd=paddleocr_repo)
+    ret = subprocess.run(train_cmd, cwd=paddleocr_abs)
     if ret.returncode != 0:
         print(f"\n[!] Training failed (exit code {ret.returncode})",
               file=sys.stderr)
@@ -4684,12 +4685,12 @@ Eval:
     inference_dir = os.path.join(output_model, "inference")
     export_cmd = [
         sys.executable,
-        os.path.join(paddleocr_repo, "tools", "export_model.py"),
+        os.path.join(paddleocr_abs, "tools", "export_model.py"),
         "-c", config_path,
         "-o", f"Global.pretrained_model={best_model}",
         f"Global.save_inference_dir={inference_dir}",
     ]
-    ret = subprocess.run(export_cmd, cwd=paddleocr_repo)
+    ret = subprocess.run(export_cmd, cwd=paddleocr_abs)
     if ret.returncode != 0:
         print(f"\n[!] Export failed (exit code {ret.returncode})",
               file=sys.stderr)
