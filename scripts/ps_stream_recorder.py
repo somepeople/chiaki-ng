@@ -1244,6 +1244,14 @@ try:
 except ImportError:
     pass
 
+_realesrgan_available = False
+try:
+    from realesrgan import RealESRGANer
+    from basicsr.archs.rrdbnet_arch import RRDBNet
+    _realesrgan_available = True
+except ImportError:
+    pass
+
 
 class TextDetector:
     """
@@ -1392,6 +1400,9 @@ class TextDetector:
         self._templates = {}
         if template_dir:
             self._load_templates(template_dir)
+
+        # Real-ESRGAN upscaler (lazy-initialized on first use)
+        self._upscaler = None
 
         # EasyOCR reader (lazy-initialized on first use to avoid slow startup)
         self._easyocr_reader = None
@@ -1794,35 +1805,87 @@ class TextDetector:
                 print(f"  [ocr] {self._detect_count} frames processed, "
                       f"last: {len(all_texts)} detections", file=sys.stderr)
 
-    @staticmethod
-    def _preprocess_roi(roi_img):
-        """Advanced preprocessing pipeline to improve OCR accuracy.
+    def _init_upscaler(self):
+        """Lazy-init Real-ESRGAN upscaler on first use."""
+        if self._upscaler is not None:
+            return
+
+        if not _realesrgan_available:
+            print("  [ocr] Real-ESRGAN not available, using cubic upscale. "
+                  "Install with: pip install realesrgan", file=sys.stderr)
+            return
+
+        # Use RealESRGAN-x4plus model (best quality for general content).
+        # For text-heavy content this recovers compression artifacts well.
+        gpu_id = None
+        try:
+            import torch
+            if torch.cuda.is_available():
+                gpu_id = 0
+        except ImportError:
+            pass
+
+        model = RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64,
+                        num_block=23, num_grow_ch=32, scale=4)
+        model_url = ("https://github.com/xinntao/Real-ESRGAN/releases/"
+                     "download/v0.1.0/RealESRGAN_x4plus.pth")
+        self._upscaler = RealESRGANer(
+            scale=4,
+            model_path=model_url,  # auto-downloads on first use
+            model=model,
+            tile=0,  # no tiling for small ROIs
+            tile_pad=10,
+            pre_pad=0,
+            half=gpu_id is not None,  # FP16 on GPU for speed
+            gpu_id=gpu_id,
+        )
+        device = "GPU" if gpu_id is not None else "CPU"
+        print(f"  [ocr] Real-ESRGAN upscaler initialized ({device})",
+              file=sys.stderr)
+
+    def _preprocess_roi(self, roi_img):
+        """Preprocessing pipeline with neural super-resolution upscaling.
+
+        Uses Real-ESRGAN (when available) instead of simple interpolation
+        to upscale small ROIs.  The neural network recovers detail lost
+        by H.264/H.265 compression — sharper text edges, reduced blocking
+        artifacts, cleaner backgrounds.
 
         Steps:
-          1. CLAHE (Contrast Limited Adaptive Histogram Equalization) - normalizes
-             contrast across the ROI, critical for game UIs with gradients/shadows
-          2. Bilateral denoise - removes noise while preserving text edges
-          3. Unsharp mask - sharpens text contours for better recognition
-          4. Upscale small ROIs - OCR engines work best on larger images
+          1. Real-ESRGAN 4x upscale (or cubic fallback)
+          2. CLAHE on luminance (contrast normalization)
+          3. Bilateral denoise (edge-preserving)
+          4. Unsharp mask (sharpen text contours)
         Returns (processed_bgr, processed_gray, scale_factor).
         """
         h, w = roi_img.shape[:2]
 
-        # Upscale small ROIs (most game scoreboards are tiny)
+        # Upscale small ROIs
         scale = 1
         if h < 60:
-            scale = max(2, 60 // h)
-            roi_img = cv2.resize(roi_img, (w * scale, h * scale),
-                                 interpolation=cv2.INTER_CUBIC)
+            self._init_upscaler()
+            if self._upscaler is not None:
+                try:
+                    upscaled, _ = self._upscaler.enhance(roi_img, outscale=4)
+                    scale = 4
+                    roi_img = upscaled
+                except Exception as e:
+                    if self.verbose:
+                        print(f"  [ocr] Real-ESRGAN failed ({e}), "
+                              f"falling back to cubic", file=sys.stderr)
+                    scale = max(2, 60 // h)
+                    roi_img = cv2.resize(roi_img, (w * scale, h * scale),
+                                         interpolation=cv2.INTER_CUBIC)
+            else:
+                scale = max(2, 60 // h)
+                roi_img = cv2.resize(roi_img, (w * scale, h * scale),
+                                     interpolation=cv2.INTER_CUBIC)
 
-        # Convert to LAB for CLAHE on luminance channel only
+        # CLAHE on luminance channel only
         lab = cv2.cvtColor(roi_img, cv2.COLOR_BGR2LAB)
         l_chan, a_chan, b_chan = cv2.split(lab)
-
-        # CLAHE: adaptive contrast enhancement
         clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(4, 4))
         l_chan = clahe.apply(l_chan)
-
         lab = cv2.merge([l_chan, a_chan, b_chan])
         enhanced = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
 
