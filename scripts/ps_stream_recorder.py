@@ -1909,7 +1909,7 @@ class TextDetector:
 
         For each player frame:
           - Extracts the player card region from the full frame
-          - OCRs each sub-field (position, name, gamertag, height, weight, perks)
+          - OCRs each sub-field (position, name, gamertag, height, weight, perks, level, ia)
             at its configured relative offset within the player card
           - For fields with "type": "ready", uses green-color detection
             instead of OCR and returns a boolean "ready" flag
