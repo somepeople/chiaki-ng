@@ -1402,8 +1402,14 @@ class TextDetector:
 
         # --- Lineup config (structured player-card detection) ---
         self._lineup_config = None
+        self._lineup_config_path = lineup_config  # keep path for hot-reload
+        self._lineup_config_mtime = 0.0
         if lineup_config:
             self._lineup_config = self._load_lineup_config(lineup_config)
+            try:
+                self._lineup_config_mtime = os.path.getmtime(lineup_config)
+            except OSError:
+                pass
 
         # EasyOCR reader (lazy-initialized on first use to avoid slow startup)
         self._easyocr_reader = None
@@ -1744,6 +1750,21 @@ class TextDetector:
                             # Holdover expired: text is genuinely gone
                             self._holdover_results.pop(roi_idx, None)
                             self._prev_roi_results.pop(roi_idx, None)
+
+            # Hot-reload lineup config if the file was modified
+            if self._lineup_config_path:
+                try:
+                    mtime = os.path.getmtime(self._lineup_config_path)
+                    if mtime > self._lineup_config_mtime:
+                        new_cfg = self._load_lineup_config(
+                            self._lineup_config_path)
+                        if new_cfg is not None:
+                            self._lineup_config = new_cfg
+                            self._lineup_config_mtime = mtime
+                            print(f"  [ocr] lineup config reloaded",
+                                  file=sys.stderr)
+                except OSError:
+                    pass
 
             # Lineup detection (structured player-card ROIs)
             lineup_data = None
