@@ -2135,33 +2135,6 @@ class TextDetector:
                         cv2.rectangle(display, (fx, fy), (fx + fw, fy + fh),
                                       (0, 0, 255), 1)
 
-    def _preprocess_roi(self, roi_img):
-        """Preprocessing pipeline for OCR accuracy.
-
-        Steps:
-          1. CLAHE on luminance (contrast normalization)
-          2. Bilateral denoise (edge-preserving)
-          3. Unsharp mask (sharpen text contours)
-        Returns (processed_bgr, processed_gray).
-        """
-        # CLAHE on luminance channel only
-        lab = cv2.cvtColor(roi_img, cv2.COLOR_BGR2LAB)
-        l_chan, a_chan, b_chan = cv2.split(lab)
-        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(4, 4))
-        l_chan = clahe.apply(l_chan)
-        lab = cv2.merge([l_chan, a_chan, b_chan])
-        enhanced = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
-
-        # Bilateral filter: denoise while keeping edges sharp
-        denoised = cv2.bilateralFilter(enhanced, d=5, sigmaColor=50, sigmaSpace=50)
-
-        # Unsharp mask: sharpen text edges
-        blurred = cv2.GaussianBlur(denoised, (0, 0), 2.0)
-        sharpened = cv2.addWeighted(denoised, 1.5, blurred, -0.5, 0)
-
-        gray = cv2.cvtColor(sharpened, cv2.COLOR_BGR2GRAY)
-        return sharpened, gray
-
     def _apply_corrections(self, texts):
         """Apply name corrections (exact dict + auto-learned) to OCR results.
 
@@ -2371,11 +2344,8 @@ class TextDetector:
                     raise
             print("[+] EasyOCR: ready.", file=sys.stderr)
 
-        # Preprocess for better accuracy
-        enhanced, _ = self._preprocess_roi(roi_img)
-
         # EasyOCR expects RGB
-        rgb = cv2.cvtColor(enhanced, cv2.COLOR_BGR2RGB)
+        rgb = cv2.cvtColor(roi_img, cv2.COLOR_BGR2RGB)
         detections = self._easyocr_reader.readtext(rgb, paragraph=False)
 
         results = []
@@ -2453,10 +2423,10 @@ class TextDetector:
 
     def _detect_tesseract(self, roi_img, gray, offset_x, offset_y):
         """Detect and recognize text using Tesseract OCR with enhanced preprocessing."""
-        _, enhanced_gray = self._preprocess_roi(roi_img)
+        gray = cv2.cvtColor(roi_img, cv2.COLOR_BGR2GRAY)
 
         # Adaptive threshold handles varying background better than global Otsu
-        thresh = cv2.adaptiveThreshold(enhanced_gray, 255,
+        thresh = cv2.adaptiveThreshold(gray, 255,
                                         cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
                                         cv2.THRESH_BINARY, 11, 2)
 
