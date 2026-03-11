@@ -4605,7 +4605,7 @@ Train:
     shuffle: true
     batch_size_per_card: {args.batch_size}
     drop_last: true
-    num_workers: 0
+    num_workers: 4
 
 Eval:
   dataset:
@@ -4626,7 +4626,7 @@ Eval:
     shuffle: false
     batch_size_per_card: {args.batch_size}
     drop_last: false
-    num_workers: 0
+    num_workers: 4
 """
     config_path = os.path.join(output_model, "rec_finetune.yml")
     with open(config_path, "w") as f:
