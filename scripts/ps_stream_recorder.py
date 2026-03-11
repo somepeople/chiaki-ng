@@ -2331,25 +2331,49 @@ class TextDetector:
     def _detect_paddleocr(self, roi_img, offset_x, offset_y):
         """Detect and recognize text using PaddleOCR (GPU-accelerated)."""
         if self._paddleocr_reader is None:
-            use_gpu = False
+            lang = self.ocr_lang[0] if self.ocr_lang else "en"
+            # New PaddleOCR API uses device parameter instead of use_gpu
+            # device="gpu:0" for GPU, omit for auto-detect
             try:
                 import paddle
-                use_gpu = paddle.device.is_compiled_with_cuda()
+                has_gpu = paddle.device.is_compiled_with_cuda()
             except (ImportError, Exception):
-                pass
+                has_gpu = False
 
-            lang = self.ocr_lang[0] if self.ocr_lang else "en"
-            print(f"[+] PaddleOCR: initializing (lang={lang}, gpu={use_gpu})...",
+            print(f"[+] PaddleOCR: initializing (lang={lang}, gpu={has_gpu})...",
                   file=sys.stderr)
             try:
-                self._paddleocr_reader = _PaddleOCR(
-                    lang=lang, use_gpu=use_gpu, show_log=False)
+                if has_gpu:
+                    self._paddleocr_reader = _PaddleOCR(
+                        lang=lang, device="gpu:0", show_log=False)
+                else:
+                    self._paddleocr_reader = _PaddleOCR(
+                        lang=lang, show_log=False)
+            except TypeError:
+                # Older PaddleOCR without device param
+                try:
+                    self._paddleocr_reader = _PaddleOCR(
+                        lang=lang, use_gpu=has_gpu, show_log=False)
+                except Exception:
+                    self._paddleocr_reader = _PaddleOCR(
+                        lang=lang, show_log=False)
             except Exception as e:
-                print(f"[!] PaddleOCR: init failed ({e}), falling back to CPU...",
+                print(f"[!] PaddleOCR: GPU init failed ({e}), retrying without GPU...",
                       file=sys.stderr)
-                self._paddleocr_reader = _PaddleOCR(
-                    lang=lang, use_gpu=False, show_log=False)
-            print("[+] PaddleOCR: ready.", file=sys.stderr)
+                try:
+                    self._paddleocr_reader = _PaddleOCR(
+                        lang=lang, show_log=False)
+                except Exception as e2:
+                    print(f"[!] PaddleOCR: init failed completely ({e2})",
+                          file=sys.stderr)
+                    self._paddleocr_reader = False  # sentinel to stop retrying
+            if self._paddleocr_reader is None:
+                self._paddleocr_reader = False
+            if self._paddleocr_reader:
+                print("[+] PaddleOCR: ready.", file=sys.stderr)
+
+        if not self._paddleocr_reader:
+            return []
 
         result = self._paddleocr_reader.ocr(roi_img, cls=False)
 
