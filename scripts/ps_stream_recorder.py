@@ -1487,7 +1487,6 @@ class TextDetector:
         self._crop_counter = 0
         if collect_crops:
             os.makedirs(collect_crops, exist_ok=True)
-            os.makedirs(os.path.join(collect_crops, "images"), exist_ok=True)
 
         # --- Custom PaddleOCR model ---
         self._rec_model_dir = rec_model_dir
@@ -1647,25 +1646,39 @@ class TextDetector:
             print(f"[!] Error writing calibration file: {e}", file=sys.stderr)
         self._calibrate_log.clear()
 
-    def _save_crop(self, roi_img, field_name, text, confidence):
+    def _save_crop(self, roi_img, field_name, text, confidence,
+                   team_key="unknown", player_idx=0):
         """Save a ROI crop image for fine-tuning dataset collection.
 
-        Images are saved to collect_crops/images/ and a labels file
-        (rec_gt_train.txt) is appended with the PaddleOCR format:
-            images/crop_00001.png\tLABEL_TEXT
+        Images are organized into subdirectories by team, player slot,
+        and field type for easy browsing and selective annotation:
+
+            images/<team_key>/<player_idx>/<field_name>/crop_000001.png
+
+        The label file (rec_gt_train.txt) uses relative paths so the
+        dataset stays portable:
+
+            images/team_a/0/gamertag/crop_000001.png\tPlayerName
         """
         if not self._collect_crops_dir or not text or confidence < 0.5:
             return
 
         self._crop_counter += 1
+        # Sanitize team_key for filesystem safety
+        safe_team = team_key.replace("/", "_").replace("\\", "_")
+        sub_dir = os.path.join("images", safe_team, str(player_idx), field_name)
+        full_dir = os.path.join(self._collect_crops_dir, sub_dir)
+        os.makedirs(full_dir, exist_ok=True)
+
         img_name = f"crop_{self._crop_counter:06d}.png"
-        img_path = os.path.join(self._collect_crops_dir, "images", img_name)
+        img_path = os.path.join(full_dir, img_name)
+        rel_path = os.path.join(sub_dir, img_name)
         label_path = os.path.join(self._collect_crops_dir, "rec_gt_train.txt")
 
         try:
             cv2.imwrite(img_path, roi_img)
             with open(label_path, "a") as f:
-                f.write(f"images/{img_name}\t{text}\n")
+                f.write(f"{rel_path}\t{text}\n")
         except OSError as e:
             if self.verbose:
                 print(f"  [crop] Error saving crop: {e}", file=sys.stderr)
@@ -2204,7 +2217,7 @@ class TextDetector:
                         team_result["name"] = " ".join(
                             t["text"] for t in name_texts)
                     team_result["name_bbox"] = (nx, ny, nw, nh)
-            for player in team_cfg.get("players", []):
+            for player_idx, player in enumerate(team_cfg.get("players", [])):
                 px, py = player["x"], player["y"]
                 pw, ph = player["width"], player["height"]
 
@@ -2266,7 +2279,9 @@ class TextDetector:
                                               best["confidence"],
                                               (abs_x, abs_y, fw, fh))
                         self._save_crop(field_roi, field_name, text,
-                                        best["confidence"])
+                                        best["confidence"],
+                                        team_key=team_key,
+                                        player_idx=player_idx)
                         player_result["fields"][field_name] = {
                             "text": text,
                             "confidence": best["confidence"],
@@ -3985,6 +4000,12 @@ Examples:
     annotate_parser.add_argument("--output", metavar="FILE",
                                  help="Output label file (default: "
                                       "DIR/rec_gt_train.txt)")
+    annotate_parser.add_argument("--field", metavar="NAME",
+                                 help="Only annotate crops for this field "
+                                      "(e.g. gamertag, position, name)")
+    annotate_parser.add_argument("--team", metavar="KEY",
+                                 help="Only annotate crops for this team key "
+                                      "(e.g. team_a, team_b)")
 
     # --- train (fine-tune PaddleOCR rec model) ---
     train_parser = subparsers.add_parser(
@@ -4315,7 +4336,32 @@ def _run_annotate(args):
         print("[!] No entries found in label file.", file=sys.stderr)
         sys.exit(1)
 
+    # Filter by --field and/or --team using the directory structure:
+    # images/<team_key>/<player_idx>/<field_name>/crop_NNNNNN.png
+    filter_field = getattr(args, 'field', None)
+    filter_team = getattr(args, 'team', None)
+    if filter_field or filter_team:
+        filtered = []
+        for entry in entries:
+            parts = entry["image"].replace("\\", "/").split("/")
+            # Expected: images / team / player_idx / field / filename
+            if len(parts) >= 5:
+                e_team, e_field = parts[1], parts[3]
+                if filter_team and e_team != filter_team:
+                    continue
+                if filter_field and e_field != filter_field:
+                    continue
+            filtered.append(entry)
+        print(f"[+] Filter: {len(filtered)}/{len(entries)} entries "
+              f"(team={filter_team or '*'}, field={filter_field or '*'})")
+        entries = filtered
+
+    if not entries:
+        print("[!] No entries match the filter.", file=sys.stderr)
+        sys.exit(1)
+
     print(f"[+] Annotate: {len(entries)} crops to review from {crops_dir}")
+    print("    Structure: images/<team>/<player>/<field>/crop_*.png")
     print("    Commands: Enter=accept, type text=correct, s=skip, q=quit\n")
 
     corrected = []
