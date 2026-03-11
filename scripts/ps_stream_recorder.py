@@ -1660,7 +1660,17 @@ class TextDetector:
                     new_w = int(display.shape[1] * self.window_scale)
                     new_h = int(display.shape[0] * self.window_scale)
                     display = cv2.resize(display, (new_w, new_h))
-                cv2.imshow("PS Stream - Text Detection", display)
+                try:
+                    cv2.imshow("PS Stream - Text Detection", display)
+                except cv2.error:
+                    print("[!] Debug window: cv2.imshow not available "
+                          "(OpenCV built without GTK/GUI support).\n"
+                          "    Install GUI support: pip install opencv-contrib-python\n"
+                          "    Or on Fedora: sudo dnf install opencv opencv-devel gtk3-devel\n"
+                          "    Disabling debug window for this session.",
+                          file=sys.stderr)
+                    self.show_window = False
+                    continue
                 key = cv2.waitKey(1) & 0xFF
                 if key == ord('q'):
                     print("  [ocr] 'q' pressed, stopping...", file=sys.stderr)
