@@ -2456,6 +2456,7 @@ class TextDetector:
                         player_out[fname] = fdata.get("text", "")
                 if "ready" not in player_out:
                     player_out["ready"] = False
+                player_out["is_ready"] = player_out["ready"]
                 team_out["players"].append(player_out)
             output["teams"][team_key] = team_out
         print(json.dumps(output, ensure_ascii=False), file=sys.stderr)
@@ -2527,7 +2528,12 @@ class TextDetector:
                         cv2.rectangle(display, (fx, fy), (fx + fw, fy + fh),
                                       color, 2)
                     else:
-                        field_color = (255, 255, 255) if is_ia else (0, 0, 255)
+                        if field_name == "gamertag":
+                            field_color = (255, 0, 255)  # violet
+                        elif is_ia:
+                            field_color = (255, 255, 255)
+                        else:
+                            field_color = (0, 0, 255)
                         cv2.rectangle(display, (fx, fy), (fx + fw, fy + fh),
                                       field_color, 1)
 
