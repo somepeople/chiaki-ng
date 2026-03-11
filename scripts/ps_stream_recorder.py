@@ -2225,25 +2225,12 @@ class TextDetector:
         """
         h, w = roi_img.shape[:2]
 
-        # Upscale small ROIs
+        # Upscale small ROIs (cubic interpolation for speed)
         scale = 1
         if h < 60:
-            self._init_upscaler()
-            if self._upscaler is not None:
-                try:
-                    roi_img = self._esrgan_enhance(roi_img)
-                    scale = 4
-                except Exception as e:
-                    if self.verbose:
-                        print(f"  [ocr] Real-ESRGAN failed ({e}), "
-                              f"falling back to cubic", file=sys.stderr)
-                    scale = max(2, 60 // h)
-                    roi_img = cv2.resize(roi_img, (w * scale, h * scale),
-                                         interpolation=cv2.INTER_CUBIC)
-            else:
-                scale = max(2, 60 // h)
-                roi_img = cv2.resize(roi_img, (w * scale, h * scale),
-                                     interpolation=cv2.INTER_CUBIC)
+            scale = max(2, 60 // h)
+            roi_img = cv2.resize(roi_img, (w * scale, h * scale),
+                                 interpolation=cv2.INTER_CUBIC)
 
         # CLAHE on luminance channel only
         lab = cv2.cvtColor(roi_img, cv2.COLOR_BGR2LAB)
