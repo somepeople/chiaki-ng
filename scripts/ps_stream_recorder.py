@@ -57,6 +57,7 @@ import ctypes
 import ctypes.util
 import json
 import os
+import re
 import signal
 import socket
 import struct
@@ -1665,6 +1666,40 @@ class TextDetector:
                        for i in range(0, len(bits), 8))
         return hashlib.md5(packed).hexdigest()
 
+    # Regex for height/weight fields: digits optionally followed by a
+    # space then the unit (cm / kg).  Used by _validate_crop_text.
+    _RE_HEIGHT = re.compile(r'^(\d+)\s*cm$', re.IGNORECASE)
+    _RE_WEIGHT = re.compile(r'^(\d+)\s*kg$', re.IGNORECASE)
+
+    def _validate_crop_text(self, field_name, text):
+        """Validate and normalise *text* for crop collection.
+
+        Returns the (possibly normalised) text, or ``None`` if the crop
+        should be discarded.
+
+        Rules
+        -----
+        * ``team_name`` – must be at least 3 characters.
+        * ``height``    – must match ``<digits> cm``; normalised to
+          ``"<digits> cm"`` (e.g. ``"175cm"`` → ``"175 cm"``).
+        * ``weight``    – must match ``<digits> kg``; normalised to
+          ``"<digits> kg"`` (e.g. ``"72kg"`` → ``"72 kg"``).
+        """
+        if field_name == "team_name":
+            if len(text.strip()) < 3:
+                return None
+        elif field_name == "height":
+            m = self._RE_HEIGHT.match(text.strip())
+            if not m:
+                return None
+            text = f"{m.group(1)} cm"
+        elif field_name == "weight":
+            m = self._RE_WEIGHT.match(text.strip())
+            if not m:
+                return None
+            text = f"{m.group(1)} kg"
+        return text
+
     def _save_crop(self, roi_img, field_name, text, confidence,
                    team_key="unknown", player_idx=0):
         """Save a ROI crop image for fine-tuning dataset collection.
@@ -1683,6 +1718,11 @@ class TextDetector:
         the dataset size for static HUD elements that repeat every frame.
         """
         if not self._collect_crops_dir or not text or confidence < 0.5:
+            return
+
+        # Validate / normalise field-specific text before saving.
+        text = self._validate_crop_text(field_name, text)
+        if text is None:
             return
 
         # ---- deduplication ----
