@@ -1350,6 +1350,10 @@ class TextDetector:
         self._prev_roi_results = {}
         self._roi_diff_threshold = 5.0  # mean pixel diff to consider "changed"
 
+        # Temporal stabilization: keep last N results per ROI to vote on text
+        self._temporal_history = {}  # roi_idx -> deque of result lists
+        self._temporal_window = 5    # number of frames to average over
+
         # Pre-loaded character templates {char: grayscale_image}
         self._templates = {}
         if template_dir:
@@ -1610,6 +1614,8 @@ class TextDetector:
                 self._prev_roi_grays[roi_idx] = gray_roi
 
                 texts = self._detect_roi(roi_img, x, y)
+                # Temporal stabilization: vote across recent frames
+                texts = self._stabilize_results(roi_idx, texts)
                 self._prev_roi_results[roi_idx] = texts
                 all_texts.extend(texts)
 
@@ -1665,8 +1671,111 @@ class TextDetector:
                 print(f"  [ocr] {self._detect_count} frames processed, "
                       f"last: {len(all_texts)} detections", file=sys.stderr)
 
+    @staticmethod
+    def _preprocess_roi(roi_img):
+        """Advanced preprocessing pipeline to improve OCR accuracy.
+
+        Steps:
+          1. CLAHE (Contrast Limited Adaptive Histogram Equalization) - normalizes
+             contrast across the ROI, critical for game UIs with gradients/shadows
+          2. Bilateral denoise - removes noise while preserving text edges
+          3. Unsharp mask - sharpens text contours for better recognition
+          4. Upscale small ROIs - OCR engines work best on larger images
+        Returns (processed_bgr, processed_gray, scale_factor).
+        """
+        h, w = roi_img.shape[:2]
+
+        # Upscale small ROIs (most game scoreboards are tiny)
+        scale = 1
+        if h < 60:
+            scale = max(2, 60 // h)
+            roi_img = cv2.resize(roi_img, (w * scale, h * scale),
+                                 interpolation=cv2.INTER_CUBIC)
+
+        # Convert to LAB for CLAHE on luminance channel only
+        lab = cv2.cvtColor(roi_img, cv2.COLOR_BGR2LAB)
+        l_chan, a_chan, b_chan = cv2.split(lab)
+
+        # CLAHE: adaptive contrast enhancement
+        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(4, 4))
+        l_chan = clahe.apply(l_chan)
+
+        lab = cv2.merge([l_chan, a_chan, b_chan])
+        enhanced = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
+
+        # Bilateral filter: denoise while keeping edges sharp
+        denoised = cv2.bilateralFilter(enhanced, d=5, sigmaColor=50, sigmaSpace=50)
+
+        # Unsharp mask: sharpen text edges
+        blurred = cv2.GaussianBlur(denoised, (0, 0), 2.0)
+        sharpened = cv2.addWeighted(denoised, 1.5, blurred, -0.5, 0)
+
+        gray = cv2.cvtColor(sharpened, cv2.COLOR_BGR2GRAY)
+        return sharpened, gray, scale
+
+    def _stabilize_results(self, roi_idx, results):
+        """Temporal stabilization: vote on text across the last N frames.
+
+        For each detected text position, keeps a rolling history and returns
+        the most frequently seen text string at that location. This filters
+        out single-frame OCR errors (e.g. "PLRYER1" on one frame when the
+        other 4 frames correctly read "PLAYER1").
+        """
+        from collections import deque, Counter
+
+        if roi_idx not in self._temporal_history:
+            self._temporal_history[roi_idx] = deque(maxlen=self._temporal_window)
+
+        self._temporal_history[roi_idx].append(results)
+        history = self._temporal_history[roi_idx]
+
+        if len(history) < 2:
+            return results  # not enough history yet
+
+        # Build a spatial index: group detections by approximate bbox center
+        # (within 15px tolerance) across all frames in history
+        all_groups = {}  # (cx_bucket, cy_bucket) -> list of (text, confidence)
+        bucket_size = 15
+        for frame_results in history:
+            for det in frame_results:
+                bx, by, bw, bh = det["bbox"]
+                cx = (bx + bw // 2) // bucket_size
+                cy = (by + bh // 2) // bucket_size
+                key = (cx, cy)
+                if key not in all_groups:
+                    all_groups[key] = []
+                all_groups[key].append((det["text"], det["confidence"], det["bbox"]))
+
+        # For each spatial group, pick the most common text (majority vote)
+        stabilized = []
+        seen_keys = set()
+        for det in results:
+            bx, by, bw, bh = det["bbox"]
+            cx = (bx + bw // 2) // bucket_size
+            cy = (by + bh // 2) // bucket_size
+            key = (cx, cy)
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+
+            if key in all_groups and len(all_groups[key]) >= 2:
+                texts = [t for t, c, b in all_groups[key]]
+                text_counts = Counter(texts)
+                best_text = text_counts.most_common(1)[0][0]
+                # Use the best confidence seen for this text
+                best_conf = max(c for t, c, b in all_groups[key] if t == best_text)
+                stabilized.append({
+                    "text": best_text,
+                    "bbox": det["bbox"],
+                    "confidence": best_conf,
+                })
+            else:
+                stabilized.append(det)
+
+        return stabilized
+
     def _detect_roi(self, roi_img, offset_x, offset_y):
-        """Dispatch to the active OCR engine."""
+        """Dispatch to the active OCR engine with preprocessing."""
         if self._ocr_engine == self.OCR_ENGINE_TEMPLATE:
             return self._detect_template(roi_img, offset_x, offset_y)
         elif self._ocr_engine == self.OCR_ENGINE_EASYOCR:
@@ -1691,8 +1800,11 @@ class TextDetector:
             self._easyocr_reader = easyocr.Reader(self.ocr_lang, gpu=gpu, verbose=False)
             print("[+] EasyOCR: ready.", file=sys.stderr)
 
-        # EasyOCR expects RGB or grayscale
-        rgb = cv2.cvtColor(roi_img, cv2.COLOR_BGR2RGB)
+        # Preprocess for better accuracy
+        enhanced, _, scale = self._preprocess_roi(roi_img)
+
+        # EasyOCR expects RGB
+        rgb = cv2.cvtColor(enhanced, cv2.COLOR_BGR2RGB)
         detections = self._easyocr_reader.readtext(rgb, paragraph=False)
 
         results = []
@@ -1706,9 +1818,11 @@ class TextDetector:
             y = min(ys)
             w = max(xs) - x
             h = max(ys) - y
+            # Scale coordinates back to original size
             results.append({
                 "text": text,
-                "bbox": (offset_x + x, offset_y + y, w, h),
+                "bbox": (offset_x + x // scale, offset_y + y // scale,
+                         w // scale, h // scale),
                 "confidence": float(conf),
             })
         return results
@@ -1770,17 +1884,12 @@ class TextDetector:
 
     def _detect_tesseract(self, roi_img, gray, offset_x, offset_y):
         """Detect and recognize text using Tesseract OCR with enhanced preprocessing."""
-        h_orig, w_orig = gray.shape[:2]
-
-        # Upscale small ROIs for better OCR accuracy (Tesseract works best at ~300 DPI)
-        scale = 1
-        if h_orig < 50:
-            scale = max(2, 50 // h_orig)
-            gray = cv2.resize(gray, (w_orig * scale, h_orig * scale),
-                              interpolation=cv2.INTER_CUBIC)
+        # Use the shared preprocessing pipeline (CLAHE + denoise + sharpen + upscale)
+        _, enhanced_gray, scale = self._preprocess_roi(roi_img)
 
         # Adaptive threshold handles varying background better than global Otsu
-        thresh = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        thresh = cv2.adaptiveThreshold(enhanced_gray, 255,
+                                        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
                                         cv2.THRESH_BINARY, 11, 2)
 
         # Use pytesseract to get bounding boxes and text
