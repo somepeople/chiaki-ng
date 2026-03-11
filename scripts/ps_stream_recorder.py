@@ -1291,6 +1291,23 @@ class TextDetector:
     OCR_ENGINE_TEMPLATE = "template"
     OCR_ENGINE_MSER = "mser"  # fallback, cannot identify characters
 
+    # --- Known-value dictionaries for post-processing ---
+    # Maps field names to lists of known valid values. After OCR, results
+    # are fuzzy-matched against these lists to correct common misreads.
+    KNOWN_VALUES = {
+        "mode": [
+            "EASHL 3v3", "EASHL 6v6", "EASHL Skater", "EASHL Club",
+            "EASHL Drop-In", "EASHL Goalie", "EASHL Ones",
+            "LHEAS 3c3", "LHEAS 6c6", "LHEAS Patineur", "LHEAS Club",
+            "LHEAS Gardien", "LHEAS Ones",
+            "World of CHEL", "Monde de CHEL",
+        ],
+        "position": [
+            "C", "LW", "RW", "LD", "RD", "G",
+            "AG", "AD", "DG", "DD",
+        ],
+    }
+
     def __init__(self, width, height, codec="h264",
                  on_text_detected=None,
                  rois=None,
@@ -1402,7 +1419,7 @@ class TextDetector:
 
         # Temporal stabilization: keep last N results per ROI to vote on text
         self._temporal_history = {}  # roi_idx -> deque of result lists
-        self._temporal_window = 5    # number of frames to average over
+        self._temporal_window = 15   # number of frames to vote over (was 5)
 
         # Pre-loaded character templates {char: grayscale_image}
         self._templates = {}
@@ -1965,7 +1982,9 @@ class TextDetector:
             mode_roi = frame[my:my + mh, mx:mx + mw]
             mode_texts = self._detect_roi(mode_roi, mx, my)
             if mode_texts:
-                result["mode"] = " ".join(t["text"] for t in mode_texts)
+                raw_mode = " ".join(t["text"] for t in mode_texts)
+                result["mode"] = self._fuzzy_match_known(
+                    raw_mode, self.KNOWN_VALUES.get("mode", []))
 
         # Detect each team
         for team_key, team_cfg in cfg.get("teams", {}).items():
@@ -2043,8 +2062,14 @@ class TextDetector:
                     if texts:
                         # Take the highest-confidence detection
                         best = max(texts, key=lambda t: t["confidence"])
+                        text = best["text"]
+                        # Apply known-value correction for fields with
+                        # constrained vocabularies (position, etc.)
+                        known = self.KNOWN_VALUES.get(field_name)
+                        if known:
+                            text = self._fuzzy_match_known(text, known)
                         player_result["fields"][field_name] = {
-                            "text": best["text"],
+                            "text": text,
                             "confidence": best["confidence"],
                             "bbox": (abs_x, abs_y, fw, fh),
                         }
@@ -2060,7 +2085,6 @@ class TextDetector:
 
         return result
 
-    @staticmethod
     @staticmethod
     def _print_lineup_json(lineup_data):
         """Print structured lineup data as JSON to stderr."""
@@ -2314,14 +2338,96 @@ class TextDetector:
 
         return stabilized
 
+    @staticmethod
+    def _preprocess_roi(roi_img, min_height=48):
+        """Preprocess a ROI image for better OCR accuracy.
+
+        1. Upscale small crops so text height is at least min_height px
+           (PaddleOCR works best with text >= 32px tall).
+        2. Convert to grayscale.
+        3. Apply OTSU binarization (handles light-on-dark game UI).
+        4. Invert if the background is dark (OCR expects dark text on
+           light background).
+
+        Returns a 3-channel BGR image suitable for PaddleOCR/EasyOCR.
+        """
+        h, w = roi_img.shape[:2]
+        if h == 0 or w == 0:
+            return roi_img
+
+        # 1. Upscale small images (2x-3x) so text is large enough for OCR
+        scale = 1.0
+        if h < min_height:
+            scale = min_height / h
+            scale = min(scale, 3.0)  # cap at 3x
+        if scale > 1.0:
+            new_w = int(w * scale)
+            new_h = int(h * scale)
+            roi_img = cv2.resize(roi_img, (new_w, new_h),
+                                 interpolation=cv2.INTER_CUBIC)
+
+        # 2. Grayscale
+        gray = cv2.cvtColor(roi_img, cv2.COLOR_BGR2GRAY)
+
+        # 3. OTSU binarization
+        _, binary = cv2.threshold(gray, 0, 255,
+                                  cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+        # 4. Invert if background is dark (mean of border pixels < 128)
+        # Sample the top and bottom rows as "background"
+        border = np.concatenate([binary[0, :], binary[-1, :]])
+        if border.mean() < 128:
+            binary = cv2.bitwise_not(binary)
+
+        # Convert back to 3-channel for OCR engines that expect BGR
+        return cv2.cvtColor(binary, cv2.COLOR_GRAY2BGR)
+
+    @staticmethod
+    def _fuzzy_match_known(text, known_list, max_distance=3):
+        """Match text against a list of known values using edit distance.
+
+        Returns the closest known value if within max_distance, else the
+        original text unchanged.
+        """
+        if not text or not known_list:
+            return text
+        text_upper = text.upper().strip()
+        best_match = None
+        best_dist = max_distance + 1
+        for known in known_list:
+            known_upper = known.upper()
+            # Quick exact check
+            if text_upper == known_upper:
+                return known
+            # Levenshtein distance (simple DP)
+            n, m = len(text_upper), len(known_upper)
+            if abs(n - m) > max_distance:
+                continue
+            dp = list(range(m + 1))
+            for i in range(1, n + 1):
+                prev, dp[0] = dp[0], i
+                for j in range(1, m + 1):
+                    temp = dp[j]
+                    if text_upper[i - 1] == known_upper[j - 1]:
+                        dp[j] = prev
+                    else:
+                        dp[j] = 1 + min(prev, dp[j], dp[j - 1])
+                    prev = temp
+            if dp[m] < best_dist:
+                best_dist = dp[m]
+                best_match = known
+        return best_match if best_match is not None else text
+
     def _detect_roi(self, roi_img, offset_x, offset_y):
         """Dispatch to the active OCR engine with preprocessing."""
         if self._ocr_engine == self.OCR_ENGINE_TEMPLATE:
             return self._detect_template(roi_img, offset_x, offset_y)
         elif self._ocr_engine == self.OCR_ENGINE_PADDLEOCR:
-            return self._detect_paddleocr(roi_img, offset_x, offset_y)
+            preprocessed = self._preprocess_roi(roi_img)
+            return self._detect_paddleocr(preprocessed, offset_x, offset_y)
         elif self._ocr_engine == self.OCR_ENGINE_EASYOCR:
-            return self._detect_easyocr(roi_img, offset_x, offset_y)
+            preprocessed = self._preprocess_roi(roi_img)
+            return self._detect_easyocr(preprocessed, offset_x, offset_y)
         elif self._ocr_engine == self.OCR_ENGINE_TESSERACT:
             gray = cv2.cvtColor(roi_img, cv2.COLOR_BGR2GRAY)
             return self._detect_tesseract(roi_img, gray, offset_x, offset_y)
