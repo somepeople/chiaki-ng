@@ -1335,28 +1335,25 @@ class TextDetector:
         """Start the FFmpeg decoder subprocess and detection thread."""
         codec_name = "h264" if self.codec == "h264" else "hevc"
 
-        cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error"]
-        cmd += ["-fflags", "nobuffer", "-flags", "low_delay"]
-        cmd += ["-f", codec_name, "-i", "pipe:0"]
-
+        cmd = ["ffmpeg", "-hide_banner", "-loglevel", "warning"]
         if self.hw_decoder:
-            cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error"]
             cmd += ["-hwaccel", self.hw_decoder]
-            cmd += ["-fflags", "nobuffer", "-flags", "low_delay"]
-            cmd += ["-f", codec_name, "-i", "pipe:0"]
+        # Use generous probesize so FFmpeg can find SPS/PPS and start decoding.
+        # The low_delay flags reduce buffering once decoding has started.
+        cmd += ["-probesize", "5000000", "-analyzeduration", "2000000"]
+        cmd += ["-f", codec_name, "-i", "pipe:0"]
 
         # Output raw BGR24 frames to stdout
         cmd += ["-f", "rawvideo", "-pix_fmt", "bgr24", "-an",
                 "-vsync", "drop", "pipe:1"]
 
-        if self.verbose:
-            print(f"[+] TextDetector FFmpeg: {' '.join(cmd)}", file=sys.stderr)
+        print(f"  [ocr] FFmpeg cmd: {' '.join(cmd)}", file=sys.stderr)
 
         self._ffmpeg_proc = subprocess.Popen(
             cmd,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
-            stderr=None,  # show FFmpeg errors on stderr for debugging
+            stderr=None,  # show FFmpeg errors/warnings on terminal
             bufsize=self.width * self.height * 3 * 2,  # buffer ~2 frames
         )
 
