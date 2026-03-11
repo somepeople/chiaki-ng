@@ -1244,11 +1244,10 @@ try:
 except ImportError:
     pass
 
-_realesrgan_available = False
+_onnxruntime_available = False
 try:
-    from realesrgan import RealESRGANer
-    from basicsr.archs.rrdbnet_arch import RRDBNet
-    _realesrgan_available = True
+    import onnxruntime as ort
+    _onnxruntime_available = True
 except ImportError:
     pass
 
@@ -1805,51 +1804,139 @@ class TextDetector:
                 print(f"  [ocr] {self._detect_count} frames processed, "
                       f"last: {len(all_texts)} detections", file=sys.stderr)
 
+    # URL for the Real-ESRGAN x4plus ONNX model (auto-downloaded on first use)
+    _ESRGAN_ONNX_URL = (
+        "https://huggingface.co/qualcomm/Real-ESRGAN-x4plus/resolve/main/"
+        "Real-ESRGAN-x4plus.onnx"
+    )
+
     def _init_upscaler(self):
-        """Lazy-init Real-ESRGAN upscaler on first use."""
+        """Lazy-init Real-ESRGAN ONNX upscaler on first use.
+
+        Uses ONNX Runtime directly — no torch/basicsr dependency needed.
+        The ~67 MB model is auto-downloaded to ~/.cache/realesrgan/ on
+        first use.
+        """
         if self._upscaler is not None:
             return
 
-        if not _realesrgan_available:
+        if not _onnxruntime_available:
             print("  [ocr] Real-ESRGAN not available, using cubic upscale. "
-                  "Install with: pip install realesrgan", file=sys.stderr)
+                  "Install with: pip install onnxruntime", file=sys.stderr)
             return
 
-        # Use RealESRGAN-x4plus model (best quality for general content).
-        # For text-heavy content this recovers compression artifacts well.
-        gpu_id = None
-        try:
-            import torch
-            if torch.cuda.is_available():
-                gpu_id = 0
-        except ImportError:
-            pass
+        # Download ONNX model if not cached
+        cache_dir = Path.home() / ".cache" / "realesrgan"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        model_path = cache_dir / "RealESRGAN_x4plus.onnx"
 
-        model = RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64,
-                        num_block=23, num_grow_ch=32, scale=4)
-        model_url = ("https://github.com/xinntao/Real-ESRGAN/releases/"
-                     "download/v0.1.0/RealESRGAN_x4plus.pth")
-        self._upscaler = RealESRGANer(
-            scale=4,
-            model_path=model_url,  # auto-downloads on first use
-            model=model,
-            tile=0,  # no tiling for small ROIs
-            tile_pad=10,
-            pre_pad=0,
-            half=gpu_id is not None,  # FP16 on GPU for speed
-            gpu_id=gpu_id,
-        )
-        device = "GPU" if gpu_id is not None else "CPU"
-        print(f"  [ocr] Real-ESRGAN upscaler initialized ({device})",
-              file=sys.stderr)
+        if not model_path.exists():
+            print(f"  [ocr] Downloading Real-ESRGAN ONNX model (~67 MB)...",
+                  file=sys.stderr)
+            import urllib.request
+            try:
+                urllib.request.urlretrieve(self._ESRGAN_ONNX_URL,
+                                           str(model_path))
+                print(f"  [ocr] Model saved to {model_path}", file=sys.stderr)
+            except Exception as e:
+                print(f"  [ocr] Download failed: {e}", file=sys.stderr)
+                model_path.unlink(missing_ok=True)
+                return
+
+        # Create ONNX Runtime session
+        providers = ort.get_available_providers()
+        # Prefer GPU if available
+        preferred = []
+        for p in ["CUDAExecutionProvider", "ROCMExecutionProvider",
+                   "CPUExecutionProvider"]:
+            if p in providers:
+                preferred.append(p)
+        if not preferred:
+            preferred = ["CPUExecutionProvider"]
+
+        try:
+            self._upscaler = ort.InferenceSession(
+                str(model_path), providers=preferred)
+            # Detect input size from model metadata
+            inp = self._upscaler.get_inputs()[0]
+            # Shape is typically [1, 3, H, W]
+            if (inp.shape and len(inp.shape) == 4
+                    and isinstance(inp.shape[2], int)):
+                self._esrgan_input_size = inp.shape[2]
+            else:
+                self._esrgan_input_size = 128  # default for Qualcomm model
+            actual = self._upscaler.get_providers()
+            device = "GPU" if any("CUDA" in p or "ROCM" in p
+                                  for p in actual) else "CPU"
+            print(f"  [ocr] Real-ESRGAN ONNX upscaler ready "
+                  f"({device}, input={self._esrgan_input_size}x"
+                  f"{self._esrgan_input_size})",
+                  file=sys.stderr)
+        except Exception as e:
+            print(f"  [ocr] ONNX session failed: {e}", file=sys.stderr)
+            self._upscaler = None
+
+    def _esrgan_enhance(self, img_bgr):
+        """Run Real-ESRGAN 4x upscale via ONNX Runtime.
+
+        The ONNX model expects a fixed 128x128 input.  We pad the ROI
+        to 128x128, run inference (→512x512), then crop back to the
+        original aspect ratio at 4x scale.
+
+        Args:
+            img_bgr: numpy array (H, W, 3) BGR uint8
+        Returns:
+            numpy array (H*4, W*4, 3) BGR uint8
+        """
+        h, w = img_bgr.shape[:2]
+        input_size = self._esrgan_input_size
+
+        # Pad to input_size x input_size (letterbox, black borders)
+        scale_fit = min(input_size / w, input_size / h)
+        new_w = int(w * scale_fit)
+        new_h = int(h * scale_fit)
+        resized = cv2.resize(img_bgr, (new_w, new_h),
+                             interpolation=cv2.INTER_LANCZOS4)
+        padded = np.zeros((input_size, input_size, 3), dtype=np.uint8)
+        y_off = (input_size - new_h) // 2
+        x_off = (input_size - new_w) // 2
+        padded[y_off:y_off + new_h, x_off:x_off + new_w] = resized
+
+        # Preprocess: BGR→RGB, uint8→float32 [0,1], HWC→NCHW
+        img_rgb = cv2.cvtColor(padded, cv2.COLOR_BGR2RGB)
+        img = img_rgb.astype(np.float32) / 255.0
+        img = np.transpose(img, (2, 0, 1))  # HWC → CHW
+        img = np.expand_dims(img, axis=0)     # CHW → NCHW
+
+        # Inference
+        input_name = self._upscaler.get_inputs()[0].name
+        output = self._upscaler.run(None, {input_name: img})[0]
+
+        # Postprocess: NCHW→HWC, clip [0,1], float32→uint8, RGB→BGR
+        output = np.squeeze(output, axis=0)        # NCHW → CHW
+        output = np.transpose(output, (1, 2, 0))   # CHW → HWC
+        output = np.clip(output * 255.0, 0, 255).astype(np.uint8)
+        result = cv2.cvtColor(output, cv2.COLOR_RGB2BGR)
+
+        # Crop back to original aspect ratio at 4x scale
+        out_scale = self._esrgan_input_size * 4 // input_size  # = 4
+        crop_y = y_off * out_scale
+        crop_x = x_off * out_scale
+        crop_h = new_h * out_scale
+        crop_w = new_w * out_scale
+        cropped = result[crop_y:crop_y + crop_h, crop_x:crop_x + crop_w]
+
+        # Resize to exact 4x of original dimensions
+        return cv2.resize(cropped, (w * 4, h * 4),
+                          interpolation=cv2.INTER_LANCZOS4)
 
     def _preprocess_roi(self, roi_img):
         """Preprocessing pipeline with neural super-resolution upscaling.
 
-        Uses Real-ESRGAN (when available) instead of simple interpolation
-        to upscale small ROIs.  The neural network recovers detail lost
-        by H.264/H.265 compression — sharper text edges, reduced blocking
-        artifacts, cleaner backgrounds.
+        Uses Real-ESRGAN via ONNX Runtime (when available) instead of
+        simple interpolation to upscale small ROIs.  The neural network
+        recovers detail lost by H.264/H.265 compression — sharper text
+        edges, reduced blocking artifacts, cleaner backgrounds.
 
         Steps:
           1. Real-ESRGAN 4x upscale (or cubic fallback)
@@ -1866,9 +1953,8 @@ class TextDetector:
             self._init_upscaler()
             if self._upscaler is not None:
                 try:
-                    upscaled, _ = self._upscaler.enhance(roi_img, outscale=4)
+                    roi_img = self._esrgan_enhance(roi_img)
                     scale = 4
-                    roi_img = upscaled
                 except Exception as e:
                     if self.verbose:
                         print(f"  [ocr] Real-ESRGAN failed ({e}), "
