@@ -1223,6 +1223,13 @@ try:
 except ImportError:
     pass
 
+_easyocr_available = False
+try:
+    import easyocr
+    _easyocr_available = True
+except ImportError:
+    pass
+
 _tesseract_available = False
 try:
     import pytesseract
@@ -1262,6 +1269,12 @@ class TextDetector:
         detector.stop()
     """
 
+    # OCR engine priority order (highest to lowest)
+    OCR_ENGINE_EASYOCR = "easyocr"
+    OCR_ENGINE_TESSERACT = "tesseract"
+    OCR_ENGINE_TEMPLATE = "template"
+    OCR_ENGINE_MSER = "mser"  # fallback, cannot identify characters
+
     def __init__(self, width, height, codec="h264",
                  on_text_detected=None,
                  rois=None,
@@ -1271,6 +1284,7 @@ class TextDetector:
                  hw_decoder=None,
                  show_window=False,
                  window_scale=1.0,
+                 ocr_lang=None,
                  verbose=False):
         """
         Args:
@@ -1281,12 +1295,14 @@ class TextDetector:
             rois: List of (x_frac, y_frac, w_frac, h_frac) normalized ROIs.
                   Default: full frame.
             template_dir: Path to directory with character template images
-                (A.png, B.png, ..., 0.png, ..., 9.png). If None, uses MSER.
+                (A.png, B.png, ..., 0.png, ..., 9.png). If None, uses OCR.
             skip_frames: Process every N-th frame (default 5 = ~12fps at 60fps input).
             min_confidence: Minimum confidence for template matching (0-1).
             hw_decoder: FFmpeg HW decoder name (e.g. "vaapi", "nvdec").
             show_window: Show a debug window with overlaid detections (cv2.imshow).
             window_scale: Scale factor for the debug window (e.g. 0.5 = half size).
+            ocr_lang: OCR language(s) for EasyOCR (e.g. ["en"] or ["en","fr"]).
+                      Default: ["en"].
             verbose: Print debug info.
         """
         if not _cv2_available:
@@ -1306,6 +1322,7 @@ class TextDetector:
         self.hw_decoder = hw_decoder
         self.show_window = show_window
         self.window_scale = window_scale
+        self.ocr_lang = ocr_lang or ["en"]
         self.verbose = verbose
 
         self._ffmpeg_proc = None
@@ -1327,19 +1344,42 @@ class TextDetector:
         self._write_lock = threading.Lock()
         self._write_event = threading.Event()
 
+        # Frame-diff cache: skip OCR when a ROI hasn't changed
+        # Stores the previous grayscale ROI image per ROI index
+        self._prev_roi_grays = {}
+        self._prev_roi_results = {}
+        self._roi_diff_threshold = 5.0  # mean pixel diff to consider "changed"
+
         # Pre-loaded character templates {char: grayscale_image}
         self._templates = {}
         if template_dir:
             self._load_templates(template_dir)
 
-        # MSER detector (fallback when no templates)
+        # EasyOCR reader (lazy-initialized on first use to avoid slow startup)
+        self._easyocr_reader = None
+
+        # Determine active OCR engine
+        if self._templates:
+            self._ocr_engine = self.OCR_ENGINE_TEMPLATE
+        elif _easyocr_available:
+            self._ocr_engine = self.OCR_ENGINE_EASYOCR
+        elif _tesseract_available:
+            self._ocr_engine = self.OCR_ENGINE_TESSERACT
+        else:
+            self._ocr_engine = self.OCR_ENGINE_MSER
+
+        # MSER detector (fallback when no OCR engine available)
         self._mser = None
-        if not self._templates:
+        if self._ocr_engine == self.OCR_ENGINE_MSER:
             self._mser = cv2.MSER_create()
-            # Tune for game text: smaller areas, high contrast
             self._mser.setMinArea(30)
             self._mser.setMaxArea(2000)
             self._mser.setDelta(5)
+
+        print(f"[+] TextDetector OCR engine: {self._ocr_engine}", file=sys.stderr)
+        if self._ocr_engine == self.OCR_ENGINE_MSER:
+            print("[!] Warning: MSER mode cannot identify characters (shows '?'). "
+                  "Install easyocr or pytesseract for real OCR.", file=sys.stderr)
 
     def _load_templates(self, template_dir):
         """Load character template images from a directory."""
@@ -1550,17 +1590,27 @@ class TextDetector:
 
             # Run detection on each ROI
             all_texts = []
-            for roi in self.rois:
+            for roi_idx, roi in enumerate(self.rois):
                 x = int(roi[0] * self.width)
                 y = int(roi[1] * self.height)
                 w = int(roi[2] * self.width)
                 h = int(roi[3] * self.height)
                 roi_img = frame[y:y+h, x:x+w]
 
-                if self._templates:
-                    texts = self._detect_template(roi_img, x, y)
-                else:
-                    texts = self._detect_mser(roi_img, x, y)
+                # Frame-diff cache: skip OCR if this ROI hasn't changed
+                gray_roi = cv2.cvtColor(roi_img, cv2.COLOR_BGR2GRAY)
+                if roi_idx in self._prev_roi_grays:
+                    diff = cv2.absdiff(gray_roi, self._prev_roi_grays[roi_idx])
+                    mean_diff = float(np.mean(diff))
+                    if mean_diff < self._roi_diff_threshold:
+                        # ROI unchanged, reuse cached results
+                        if roi_idx in self._prev_roi_results:
+                            all_texts.extend(self._prev_roi_results[roi_idx])
+                        continue
+                self._prev_roi_grays[roi_idx] = gray_roi
+
+                texts = self._detect_roi(roi_img, x, y)
+                self._prev_roi_results[roi_idx] = texts
                 all_texts.extend(texts)
 
             self._detect_count += 1
@@ -1596,7 +1646,7 @@ class TextDetector:
                     cv2.putText(display, label, (bx + 2, by - 4),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
                 # Stats overlay
-                stats = f"Frame #{self._detect_count} | {len(all_texts)} detections"
+                stats = f"Frame #{self._detect_count} | {len(all_texts)} det | {self._ocr_engine}"
                 cv2.putText(display, stats, (10, display.shape[0] - 10),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 1)
                 # Scale
@@ -1614,6 +1664,54 @@ class TextDetector:
             if self.verbose and self._detect_count % 60 == 0:
                 print(f"  [ocr] {self._detect_count} frames processed, "
                       f"last: {len(all_texts)} detections", file=sys.stderr)
+
+    def _detect_roi(self, roi_img, offset_x, offset_y):
+        """Dispatch to the active OCR engine."""
+        if self._ocr_engine == self.OCR_ENGINE_TEMPLATE:
+            return self._detect_template(roi_img, offset_x, offset_y)
+        elif self._ocr_engine == self.OCR_ENGINE_EASYOCR:
+            return self._detect_easyocr(roi_img, offset_x, offset_y)
+        elif self._ocr_engine == self.OCR_ENGINE_TESSERACT:
+            gray = cv2.cvtColor(roi_img, cv2.COLOR_BGR2GRAY)
+            return self._detect_tesseract(roi_img, gray, offset_x, offset_y)
+        else:
+            return self._detect_mser(roi_img, offset_x, offset_y)
+
+    def _detect_easyocr(self, roi_img, offset_x, offset_y):
+        """Detect and recognize text using EasyOCR (neural network)."""
+        # Lazy-init: load model on first call (avoids slow startup)
+        if self._easyocr_reader is None:
+            try:
+                import torch
+                gpu = torch.cuda.is_available()
+            except ImportError:
+                gpu = False
+            print(f"[+] EasyOCR: initializing (lang={self.ocr_lang}, gpu={gpu})...",
+                  file=sys.stderr)
+            self._easyocr_reader = easyocr.Reader(self.ocr_lang, gpu=gpu, verbose=False)
+            print("[+] EasyOCR: ready.", file=sys.stderr)
+
+        # EasyOCR expects RGB or grayscale
+        rgb = cv2.cvtColor(roi_img, cv2.COLOR_BGR2RGB)
+        detections = self._easyocr_reader.readtext(rgb, paragraph=False)
+
+        results = []
+        for bbox_pts, text, conf in detections:
+            if conf < self.min_confidence:
+                continue
+            # bbox_pts is [[x1,y1],[x2,y1],[x2,y2],[x1,y2]]
+            xs = [int(p[0]) for p in bbox_pts]
+            ys = [int(p[1]) for p in bbox_pts]
+            x = min(xs)
+            y = min(ys)
+            w = max(xs) - x
+            h = max(ys) - y
+            results.append({
+                "text": text,
+                "bbox": (offset_x + x, offset_y + y, w, h),
+                "confidence": float(conf),
+            })
+        return results
 
     def _detect_template(self, roi_img, offset_x, offset_y):
         """Detect characters using template matching."""
@@ -1643,14 +1741,8 @@ class TextDetector:
         return results
 
     def _detect_mser(self, roi_img, offset_x, offset_y):
-        """Detect text regions using MSER, with Tesseract OCR when available."""
+        """Detect text regions using MSER (cannot identify characters, shows '?')."""
         gray = cv2.cvtColor(roi_img, cv2.COLOR_BGR2GRAY)
-
-        # If Tesseract is available, use it directly on the ROI for real OCR
-        if _tesseract_available:
-            return self._detect_tesseract(roi_img, gray, offset_x, offset_y)
-
-        # Fallback: MSER region detection only (cannot identify characters)
         regions, _ = self._mser.detectRegions(gray)
         results = []
 
@@ -1677,23 +1769,39 @@ class TextDetector:
         return results
 
     def _detect_tesseract(self, roi_img, gray, offset_x, offset_y):
-        """Detect and recognize text using Tesseract OCR."""
-        # Preprocess: threshold to improve OCR accuracy
-        _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        """Detect and recognize text using Tesseract OCR with enhanced preprocessing."""
+        h_orig, w_orig = gray.shape[:2]
+
+        # Upscale small ROIs for better OCR accuracy (Tesseract works best at ~300 DPI)
+        scale = 1
+        if h_orig < 50:
+            scale = max(2, 50 // h_orig)
+            gray = cv2.resize(gray, (w_orig * scale, h_orig * scale),
+                              interpolation=cv2.INTER_CUBIC)
+
+        # Adaptive threshold handles varying background better than global Otsu
+        thresh = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                        cv2.THRESH_BINARY, 11, 2)
 
         # Use pytesseract to get bounding boxes and text
+        # --psm 6: assume uniform block of text
+        # -c tessedit_char_whitelist: restrict to common game text characters
+        config = ("--psm 6 "
+                  "-c tessedit_char_whitelist="
+                  "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789 .-:")
         data = pytesseract.image_to_data(thresh, output_type=pytesseract.Output.DICT,
-                                          config="--psm 6")
+                                          config=config)
         results = []
         n = len(data["text"])
         for i in range(n):
             text = data["text"][i].strip()
             conf = int(data["conf"][i])
             if text and conf > 0:
-                x = data["left"][i]
-                y = data["top"][i]
-                w = data["width"][i]
-                h = data["height"][i]
+                # Scale bounding boxes back to original coordinates
+                x = int(data["left"][i] / scale)
+                y = int(data["top"][i] / scale)
+                w = int(data["width"][i] / scale)
+                h = int(data["height"][i] / scale)
                 results.append({
                     "text": text,
                     "bbox": (offset_x + x, offset_y + y, w, h),
@@ -1816,7 +1924,8 @@ class StreamOutput:
                  text_skip_frames=5,
                  text_min_confidence=0.7,
                  show_debug_window=False,
-                 debug_window_scale=0.5):
+                 debug_window_scale=0.5,
+                 ocr_lang=None):
         self.host = host
         self.regist_key = regist_key
         self.morning = morning
@@ -1845,6 +1954,7 @@ class StreamOutput:
         self.text_min_confidence = text_min_confidence
         self.show_debug_window = show_debug_window
         self.debug_window_scale = debug_window_scale
+        self.ocr_lang = ocr_lang
         self._text_detector = None
 
         self._lib = load_libchiaki(lib_path)
@@ -2137,6 +2247,7 @@ class StreamOutput:
                 hw_decoder=self.hw_decoder,
                 show_window=self.show_debug_window,
                 window_scale=self.debug_window_scale,
+                ocr_lang=self.ocr_lang,
                 verbose=self.verbose,
             )
             self._text_detector.start()
@@ -2726,6 +2837,9 @@ Examples:
                                help="Show OpenCV debug window with video and detection overlays (press 'q' to quit)")
     stream_parser.add_argument("--debug-scale", type=float, default=0.5,
                                help="Scale factor for debug window (default: 0.5 = half size)")
+    stream_parser.add_argument("--ocr-lang", metavar="LANG", action="append",
+                               help="OCR language for EasyOCR (e.g. en, fr). "
+                                    "Can be specified multiple times. Default: en.")
 
     args = parser.parse_args()
 
@@ -2981,6 +3095,7 @@ Examples:
             text_min_confidence=args.text_confidence,
             show_debug_window=args.debug_window,
             debug_window_scale=args.debug_scale,
+            ocr_lang=getattr(args, 'ocr_lang', None),
         )
         streamer.stream()
 
