@@ -1244,12 +1244,6 @@ try:
 except ImportError:
     pass
 
-_onnxruntime_available = False
-try:
-    import onnxruntime as ort
-    _onnxruntime_available = True
-except ImportError:
-    pass
 
 
 class TextDetector:
@@ -1405,9 +1399,6 @@ class TextDetector:
         self._templates = {}
         if template_dir:
             self._load_templates(template_dir)
-
-        # Real-ESRGAN upscaler (lazy-initialized on first use)
-        self._upscaler = None
 
         # --- Lineup config (structured player-card detection) ---
         self._lineup_config = None
@@ -1843,156 +1834,6 @@ class TextDetector:
                 print(f"  [ocr] {self._detect_count} frames processed, "
                       f"last: {len(all_texts)} detections", file=sys.stderr)
 
-    # URL for the Real-ESRGAN x4plus ONNX model (auto-downloaded on first use)
-    _ESRGAN_ONNX_URL = (
-        "https://huggingface.co/qualcomm/Real-ESRGAN-x4plus/resolve/"
-        "01179a4da7bf5ac91faca650e6afbf282ac93933/"
-        "Real-ESRGAN-x4plus.onnx"
-    )
-
-    def _init_upscaler(self):
-        """Lazy-init Real-ESRGAN ONNX upscaler on first use.
-
-        Uses ONNX Runtime directly — no torch/basicsr dependency needed.
-        The ~67 MB model is auto-downloaded to ~/.cache/realesrgan/ on
-        first use.
-        """
-        if self._upscaler is not None:
-            return
-
-        if not _onnxruntime_available:
-            print("  [ocr] Real-ESRGAN not available, using cubic upscale. "
-                  "Install with: pip install onnxruntime", file=sys.stderr)
-            return
-
-        # Download ONNX model if not cached
-        cache_dir = Path.home() / ".cache" / "realesrgan"
-        cache_dir.mkdir(parents=True, exist_ok=True)
-        model_path = cache_dir / "RealESRGAN_x4plus.onnx"
-
-        if not model_path.exists():
-            print(f"  [ocr] Downloading Real-ESRGAN ONNX model (~67 MB)...",
-                  file=sys.stderr)
-            import urllib.request
-            try:
-                urllib.request.urlretrieve(self._ESRGAN_ONNX_URL,
-                                           str(model_path))
-                print(f"  [ocr] Model saved to {model_path}", file=sys.stderr)
-            except Exception as e:
-                print(f"  [ocr] Download failed: {e}", file=sys.stderr)
-                model_path.unlink(missing_ok=True)
-                return
-
-        # Create ONNX Runtime session
-        providers = ort.get_available_providers()
-        # Prefer GPU if available
-        preferred = []
-        for p in ["CUDAExecutionProvider", "ROCMExecutionProvider",
-                   "CPUExecutionProvider"]:
-            if p in providers:
-                preferred.append(p)
-        if not preferred:
-            preferred = ["CPUExecutionProvider"]
-
-        try:
-            self._upscaler = ort.InferenceSession(
-                str(model_path), providers=preferred)
-            # Detect input size from model metadata
-            inp = self._upscaler.get_inputs()[0]
-            # Shape is typically [1, 3, H, W]
-            if (inp.shape and len(inp.shape) == 4
-                    and isinstance(inp.shape[2], int)):
-                self._esrgan_input_size = inp.shape[2]
-            else:
-                self._esrgan_input_size = 128  # default for Qualcomm model
-            actual = self._upscaler.get_providers()
-            device = "GPU" if any("CUDA" in p or "ROCM" in p
-                                  for p in actual) else "CPU"
-            print(f"  [ocr] Real-ESRGAN ONNX upscaler ready "
-                  f"({device}, input={self._esrgan_input_size}x"
-                  f"{self._esrgan_input_size})",
-                  file=sys.stderr)
-        except Exception as e:
-            print(f"  [ocr] ONNX session failed: {e}", file=sys.stderr)
-            self._upscaler = None
-
-    def _esrgan_run_tile(self, tile_bgr):
-        """Run a single 128x128 tile through the ONNX model → 512x512.
-
-        Args:
-            tile_bgr: numpy array (128, 128, 3) BGR uint8
-        Returns:
-            numpy array (512, 512, 3) BGR uint8
-        """
-        img_rgb = cv2.cvtColor(tile_bgr, cv2.COLOR_BGR2RGB)
-        img = img_rgb.astype(np.float32) / 255.0
-        img = np.transpose(img, (2, 0, 1))
-        img = np.expand_dims(img, axis=0)
-
-        input_name = self._upscaler.get_inputs()[0].name
-        output = self._upscaler.run(None, {input_name: img})[0]
-
-        output = np.squeeze(output, axis=0)
-        output = np.transpose(output, (1, 2, 0))
-        output = np.clip(output * 255.0, 0, 255).astype(np.uint8)
-        return cv2.cvtColor(output, cv2.COLOR_RGB2BGR)
-
-    def _esrgan_enhance(self, img_bgr):
-        """Run Real-ESRGAN 4x upscale via ONNX Runtime with tiling.
-
-        The ONNX model expects a fixed 128x128 input.  We split the
-        image into overlapping 128x128 tiles, upscale each to 512x512,
-        blend overlapping edges, and stitch the result.  This avoids
-        downscaling wide text ROIs (which destroys small letter detail).
-
-        Args:
-            img_bgr: numpy array (H, W, 3) BGR uint8
-        Returns:
-            numpy array (H*4, W*4, 3) BGR uint8
-        """
-        tile = self._esrgan_input_size   # 128
-        out_tile = tile * 4               # 512
-        overlap = 8                       # overlap in input pixels
-        out_overlap = overlap * 4         # 32 in output pixels
-        h, w = img_bgr.shape[:2]
-
-        # Pad image so dimensions are multiples of (tile - overlap)
-        step = tile - overlap  # 120
-        pad_h = (step - (h % step)) % step
-        pad_w = (step - (w % step)) % step
-        padded = cv2.copyMakeBorder(img_bgr, 0, pad_h, 0, pad_w,
-                                    cv2.BORDER_REFLECT_101)
-        ph, pw = padded.shape[:2]
-
-        # Allocate output + weight buffer for blending
-        out_h, out_w = ph * 4, pw * 4
-        result = np.zeros((out_h, out_w, 3), dtype=np.float32)
-        weight = np.zeros((out_h, out_w, 1), dtype=np.float32)
-
-        # Build 1-D ramp for blending overlapping edges
-        ramp = np.ones(out_tile, dtype=np.float32)
-        if out_overlap > 0:
-            ramp[:out_overlap] = np.linspace(0, 1, out_overlap)
-            ramp[-out_overlap:] = np.linspace(1, 0, out_overlap)
-        # 2-D weight map: outer product of horizontal and vertical ramps
-        w_map = (ramp[:, None] * ramp[None, :])[:, :, None]  # (512,512,1)
-
-        for y in range(0, ph - tile + 1, step):
-            for x in range(0, pw - tile + 1, step):
-                patch = padded[y:y + tile, x:x + tile]
-                out_patch = self._esrgan_run_tile(patch).astype(np.float32)
-
-                oy, ox = y * 4, x * 4
-                result[oy:oy + out_tile, ox:ox + out_tile] += out_patch * w_map
-                weight[oy:oy + out_tile, ox:ox + out_tile] += w_map
-
-        # Normalize by accumulated weight and convert back to uint8
-        weight = np.maximum(weight, 1e-6)
-        result = np.clip(result / weight, 0, 255).astype(np.uint8)
-
-        # Crop to exact 4x of original dimensions
-        return result[:h * 4, :w * 4]
-
     # ------------------------------------------------------------------
     # Lineup config: structured player-card ROI detection
     # ------------------------------------------------------------------
@@ -2209,15 +2050,10 @@ class TextDetector:
                                     (255, 255, 255), 1)
 
     def _preprocess_roi(self, roi_img):
-        """Preprocessing pipeline with neural super-resolution upscaling.
-
-        Uses Real-ESRGAN via ONNX Runtime (when available) instead of
-        simple interpolation to upscale small ROIs.  The neural network
-        recovers detail lost by H.264/H.265 compression — sharper text
-        edges, reduced blocking artifacts, cleaner backgrounds.
+        """Preprocessing pipeline for OCR accuracy.
 
         Steps:
-          1. Real-ESRGAN 4x upscale (or cubic fallback)
+          1. Cubic upscale for small ROIs (< 60px height)
           2. CLAHE on luminance (contrast normalization)
           3. Bilateral denoise (edge-preserving)
           4. Unsharp mask (sharpen text contours)
