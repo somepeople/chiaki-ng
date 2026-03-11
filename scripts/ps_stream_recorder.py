@@ -4055,8 +4055,8 @@ Examples:
                               metavar="DIR",
                               help="Output directory for the fine-tuned model "
                                    "(default: ./ocr_model_finetuned)")
-    train_parser.add_argument("--epochs", type=int, default=10,
-                              help="Number of training epochs (default: 10)")
+    train_parser.add_argument("--epochs", type=int, default=100,
+                              help="Number of training epochs (default: 100)")
     train_parser.add_argument("--batch-size", type=int, default=32,
                               help="Batch size (default: 32)")
     train_parser.add_argument("--lr", type=float, default=0.0005,
@@ -4688,12 +4688,21 @@ Eval:
     # 7. Export inference model
     print("\n[+] Exporting inference model...")
     best_model = os.path.join(output_model, "train", "best_accuracy")
+    latest_model = os.path.join(output_model, "train", "latest")
+    if os.path.exists(best_model + ".pdparams"):
+        export_model = best_model
+    elif os.path.exists(latest_model + ".pdparams"):
+        print("[*] No best_accuracy model found (acc stayed at 0), using latest checkpoint")
+        export_model = latest_model
+    else:
+        print("[!] No trained model found to export", file=sys.stderr)
+        sys.exit(1)
     inference_dir = os.path.join(output_model, "inference")
     export_cmd = [
         sys.executable,
         os.path.join(paddleocr_abs, "tools", "export_model.py"),
         "-c", config_path,
-        "-o", f"Global.pretrained_model={best_model}",
+        "-o", f"Global.pretrained_model={export_model}",
         f"Global.save_inference_dir={inference_dir}",
     ]
     ret = subprocess.run(export_cmd, cwd=paddleocr_abs)
