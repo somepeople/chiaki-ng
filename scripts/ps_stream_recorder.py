@@ -4526,6 +4526,9 @@ Global:
   pretrained_model: null
   checkpoints: null
   use_visualdl: false
+  log_smooth_window: 20
+  print_batch_step: 10
+  cal_metric_during_train: true
   character_dict_path: {os.path.abspath(dict_file)}
   max_text_length: 50
   use_space_char: true
