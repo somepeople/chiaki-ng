@@ -1742,6 +1742,11 @@ class TextDetector:
         rel_path = os.path.join(sub_dir, img_name)
         label_path = os.path.join(self._collect_crops_dir, "rec_gt_train.txt")
 
+        # Upscale 3x with cubic interpolation to preserve quality.
+        h, w = roi_img.shape[:2]
+        roi_img = cv2.resize(roi_img, (w * 3, h * 3),
+                             interpolation=cv2.INTER_CUBIC)
+
         try:
             cv2.imwrite(img_path, roi_img)
             with open(label_path, "a") as f:
