@@ -4669,13 +4669,22 @@ def _run_train(args):
     os.makedirs(output_model, exist_ok=True)
 
     use_gpu = "false" if args.cpu else "true"
+
+    # Compute iters per epoch so we can set eval frequency appropriately
+    iters_per_epoch = max(1, len(train_lines) // args.batch_size)
+    # Eval every epoch (or every iter if < 10 iters/epoch) so best_accuracy
+    # is saved even for small datasets / short runs.
+    eval_step = max(1, iters_per_epoch)
+    # Warmup should not exceed 20% of total epochs (and at least 1 if > 5 epochs)
+    warmup_epoch = max(1, min(2, args.epochs // 5))
+
     config_yaml = f"""\
 Global:
   use_gpu: {use_gpu}
   epoch_num: {args.epochs}
   save_model_dir: {output_model}/train
   save_epoch_step: 1
-  eval_batch_step: [0, 100]
+  eval_batch_step: [0, {eval_step}]
   pretrained_model: null
   checkpoints: null
   use_visualdl: false
@@ -4723,7 +4732,7 @@ Optimizer:
   lr:
     name: Cosine
     learning_rate: {args.lr}
-    warmup_epoch: 2
+    warmup_epoch: {warmup_epoch}
   regularizer:
     name: L2
     factor: 0.00001
@@ -4855,7 +4864,10 @@ Eval:
         "-o", f"Global.pretrained_model={export_model}",
         f"Global.save_inference_dir={inference_dir}",
     ]
-    ret = subprocess.run(export_cmd, cwd=paddleocr_abs)
+    # Disable PIR API to avoid AssertionError in newer PaddlePaddle versions
+    export_env = os.environ.copy()
+    export_env["FLAGS_enable_pir_api"] = "0"
+    ret = subprocess.run(export_cmd, cwd=paddleocr_abs, env=export_env)
     if ret.returncode != 0:
         print(f"\n[!] Export failed (exit code {ret.returncode})",
               file=sys.stderr)
