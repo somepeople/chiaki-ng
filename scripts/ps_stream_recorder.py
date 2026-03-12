@@ -2824,6 +2824,12 @@ class TextDetector:
         if self._ocr_engine == self.OCR_ENGINE_TEMPLATE:
             return self._detect_template(roi_img, offset_x, offset_y)
         elif self._ocr_engine == self.OCR_ENGINE_PADDLEOCR:
+            # Skip OTSU binarization when a custom rec model is used:
+            # the model was trained on raw crops (collected via
+            # --collect-crops), so feeding it binarized images causes
+            # recognition failures.
+            if self._rec_model_dir:
+                return self._detect_paddleocr(roi_img, offset_x, offset_y)
             preprocessed = self._preprocess_roi(roi_img)
             return self._detect_paddleocr(preprocessed, offset_x, offset_y)
         elif self._ocr_engine == self.OCR_ENGINE_EASYOCR:
