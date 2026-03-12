@@ -2761,16 +2761,11 @@ class TextDetector:
         if h == 0 or w == 0:
             return roi_img
 
-        # 1. Upscale small images (2x-3x) so text is large enough for OCR
-        scale = 1.0
-        if h < min_height:
-            scale = min_height / h
-            scale = min(scale, 3.0)  # cap at 3x
-        if scale > 1.0:
-            new_w = int(w * scale)
-            new_h = int(h * scale)
-            roi_img = cv2.resize(roi_img, (new_w, new_h),
-                                 interpolation=cv2.INTER_CUBIC)
+        # 1. Always upscale 3x for consistent OCR quality
+        new_w = w * 3
+        new_h = h * 3
+        roi_img = cv2.resize(roi_img, (new_w, new_h),
+                             interpolation=cv2.INTER_CUBIC)
 
         # 2. Grayscale
         gray = cv2.cvtColor(roi_img, cv2.COLOR_BGR2GRAY)
