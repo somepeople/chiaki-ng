@@ -2761,11 +2761,16 @@ class TextDetector:
         if h == 0 or w == 0:
             return roi_img
 
-        # 1. Always upscale 3x for consistent OCR quality
-        new_w = w * 3
-        new_h = h * 3
-        roi_img = cv2.resize(roi_img, (new_w, new_h),
-                             interpolation=cv2.INTER_CUBIC)
+        # 1. Upscale small images (2x-3x) so text is large enough for OCR
+        scale = 1.0
+        if h < min_height:
+            scale = min_height / h
+            scale = min(scale, 3.0)  # cap at 3x
+        if scale > 1.0:
+            new_w = int(w * scale)
+            new_h = int(h * scale)
+            roi_img = cv2.resize(roi_img, (new_w, new_h),
+                                 interpolation=cv2.INTER_CUBIC)
 
         # 2. Grayscale
         gray = cv2.cvtColor(roi_img, cv2.COLOR_BGR2GRAY)
@@ -2825,13 +2830,6 @@ class TextDetector:
             return self._detect_template(roi_img, offset_x, offset_y)
         elif self._ocr_engine == self.OCR_ENGINE_PADDLEOCR:
             preprocessed = self._preprocess_roi(roi_img)
-            if self._rec_model_dir:
-                # Custom rec model: use preprocessed image for detection,
-                # but pass the raw image for recognition (the model was
-                # trained on raw crops from --collect-crops).
-                return self._detect_paddleocr(
-                    preprocessed, offset_x, offset_y,
-                    raw_img=roi_img)
             return self._detect_paddleocr(preprocessed, offset_x, offset_y)
         elif self._ocr_engine == self.OCR_ENGINE_EASYOCR:
             preprocessed = self._preprocess_roi(roi_img)
@@ -2842,15 +2840,8 @@ class TextDetector:
         else:
             return self._detect_mser(roi_img, offset_x, offset_y)
 
-    def _detect_paddleocr(self, roi_img, offset_x, offset_y,
-                          raw_img=None):
-        """Detect and recognize text using PaddleOCR (GPU-accelerated).
-
-        When *raw_img* is provided, use *roi_img* (preprocessed) for text
-        detection only, then run recognition on *raw_img* (the original
-        un-binarized crop).  This avoids feeding OTSU-binarized images
-        to a custom rec model that was trained on raw crops.
-        """
+    def _detect_paddleocr(self, roi_img, offset_x, offset_y):
+        """Detect and recognize text using PaddleOCR (GPU-accelerated)."""
         if self._paddleocr_reader is None:
             lang = self.ocr_lang[0] if self.ocr_lang else "en"
             try:
@@ -2903,119 +2894,7 @@ class TextDetector:
         if not self._paddleocr_reader:
             return []
 
-        # --- Two-pass mode (custom rec model) ---
-        # Pass 1: detect text regions on the preprocessed image.
-        # Pass 2: recognize each crop from the raw (un-binarized) image.
-        if raw_img is not None:
-            try:
-                det_result = self._paddleocr_reader.ocr(
-                    roi_img, cls=False, rec=False)
-            except (IndexError, Exception):
-                det_result = None
-
-            if not det_result or not det_result[0]:
-                # Det found nothing on preprocessed image either —
-                # fall back to rec-only on the whole raw crop.
-                # Upscale small crops so text height >= 32px.
-                rec_input = raw_img
-                rih, riw = rec_input.shape[:2]
-                if rih > 0 and rih < 32:
-                    scale = max(2, 32 // rih + 1)
-                    rec_input = cv2.resize(
-                        rec_input, (riw * scale, rih * scale),
-                        interpolation=cv2.INTER_CUBIC)
-                try:
-                    rec_result = self._paddleocr_reader.ocr(
-                        rec_input, cls=False, det=False)
-                except (IndexError, Exception):
-                    rec_result = None
-                if not rec_result or not rec_result[0]:
-                    if self.verbose:
-                        print("  [paddleocr] no det + no rec-only result",
-                              file=sys.stderr)
-                    return []
-                results = []
-                for item in rec_result[0]:
-                    text, conf = item
-                    if self.verbose:
-                        print(f"  [paddleocr] rec-only: '{text}' "
-                              f"conf={conf:.3f}", file=sys.stderr)
-                    if conf < self.min_confidence:
-                        continue
-                    h, w = raw_img.shape[:2]
-                    results.append({
-                        "text": text,
-                        "bbox": (offset_x, offset_y, w, h),
-                        "confidence": float(conf),
-                    })
-                return results
-
-            # Det found regions — run rec on each crop from raw_img
-            results = []
-            rh, rw = raw_img.shape[:2]
-            ph, pw = roi_img.shape[:2]
-            # Scale factor from preprocessed coords back to raw coords
-            sx = rw / pw if pw else 1
-            sy = rh / ph if ph else 1
-            for bbox_pts in det_result[0]:
-                xs = [int(p[0] * sx) for p in bbox_pts]
-                ys = [int(p[1] * sy) for p in bbox_pts]
-                x1, x2 = max(0, min(xs)), min(rw, max(xs))
-                y1, y2 = max(0, min(ys)), min(rh, max(ys))
-                if x2 <= x1 or y2 <= y1:
-                    continue
-                # Add padding around the crop (10% of each dimension,
-                # min 4px) — tight crops hurt rec accuracy.
-                pad_x = max(4, int((x2 - x1) * 0.1))
-                pad_y = max(4, int((y2 - y1) * 0.1))
-                cx1 = max(0, x1 - pad_x)
-                cy1 = max(0, y1 - pad_y)
-                cx2 = min(rw, x2 + pad_x)
-                cy2 = min(rh, y2 + pad_y)
-                crop = raw_img[cy1:cy2, cx1:cx2]
-                # Upscale small crops so text height >= 32px
-                ch, cw = crop.shape[:2]
-                if ch > 0 and ch < 32:
-                    scale = max(2, 32 // ch + 1)
-                    crop = cv2.resize(
-                        crop, (cw * scale, ch * scale),
-                        interpolation=cv2.INTER_CUBIC)
-                try:
-                    rec_result = self._paddleocr_reader.ocr(
-                        crop, cls=False, det=False)
-                except (IndexError, Exception):
-                    continue
-                if not rec_result or not rec_result[0]:
-                    continue
-                text, conf = rec_result[0][0]
-                if self.verbose:
-                    print(f"  [paddleocr] det+rec: '{text}' "
-                          f"conf={conf:.3f}", file=sys.stderr)
-                if conf < self.min_confidence:
-                    continue
-                results.append({
-                    "text": text,
-                    "bbox": (offset_x + x1, offset_y + y1,
-                             x2 - x1, y2 - y1),
-                    "confidence": float(conf),
-                })
-            return results
-
-        # --- Standard single-pass mode ---
-        try:
-            result = self._paddleocr_reader.ocr(roi_img, cls=False)
-        except IndexError:
-            if not getattr(self, "_paddle_index_warned", False):
-                self._paddle_index_warned = True
-                print(
-                    "[!] PaddleOCR IndexError: your rec_model_dir likely "
-                    "contains a training checkpoint, not an exported "
-                    "inference model.  Run PaddleOCR's export_model.py "
-                    "first, or remove --rec-model-dir / "
-                    "--rec-char-dict-path to use the default model.",
-                    file=sys.stderr,
-                )
-            return []
+        result = self._paddleocr_reader.ocr(roi_img, cls=False)
 
         results = []
         if not result or not result[0]:
