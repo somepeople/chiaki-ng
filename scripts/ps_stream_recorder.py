@@ -2916,9 +2916,17 @@ class TextDetector:
             if not det_result or not det_result[0]:
                 # Det found nothing on preprocessed image either —
                 # fall back to rec-only on the whole raw crop.
+                # Upscale small crops so text height >= 32px.
+                rec_input = raw_img
+                rih, riw = rec_input.shape[:2]
+                if rih > 0 and rih < 32:
+                    scale = max(2, 32 // rih + 1)
+                    rec_input = cv2.resize(
+                        rec_input, (riw * scale, rih * scale),
+                        interpolation=cv2.INTER_CUBIC)
                 try:
                     rec_result = self._paddleocr_reader.ocr(
-                        raw_img, cls=False, det=False)
+                        rec_input, cls=False, det=False)
                 except (IndexError, Exception):
                     rec_result = None
                 if not rec_result or not rec_result[0]:
@@ -2956,7 +2964,22 @@ class TextDetector:
                 y1, y2 = max(0, min(ys)), min(rh, max(ys))
                 if x2 <= x1 or y2 <= y1:
                     continue
-                crop = raw_img[y1:y2, x1:x2]
+                # Add padding around the crop (10% of each dimension,
+                # min 4px) — tight crops hurt rec accuracy.
+                pad_x = max(4, int((x2 - x1) * 0.1))
+                pad_y = max(4, int((y2 - y1) * 0.1))
+                cx1 = max(0, x1 - pad_x)
+                cy1 = max(0, y1 - pad_y)
+                cx2 = min(rw, x2 + pad_x)
+                cy2 = min(rh, y2 + pad_y)
+                crop = raw_img[cy1:cy2, cx1:cx2]
+                # Upscale small crops so text height >= 32px
+                ch, cw = crop.shape[:2]
+                if ch > 0 and ch < 32:
+                    scale = max(2, 32 // ch + 1)
+                    crop = cv2.resize(
+                        crop, (cw * scale, ch * scale),
+                        interpolation=cv2.INTER_CUBIC)
                 try:
                     rec_result = self._paddleocr_reader.ocr(
                         crop, cls=False, det=False)
