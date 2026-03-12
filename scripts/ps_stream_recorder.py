@@ -2824,13 +2824,14 @@ class TextDetector:
         if self._ocr_engine == self.OCR_ENGINE_TEMPLATE:
             return self._detect_template(roi_img, offset_x, offset_y)
         elif self._ocr_engine == self.OCR_ENGINE_PADDLEOCR:
-            # Skip OTSU binarization when a custom rec model is used:
-            # the model was trained on raw crops (collected via
-            # --collect-crops), so feeding it binarized images causes
-            # recognition failures.
-            if self._rec_model_dir:
-                return self._detect_paddleocr(roi_img, offset_x, offset_y)
             preprocessed = self._preprocess_roi(roi_img)
+            if self._rec_model_dir:
+                # Custom rec model: use preprocessed image for detection,
+                # but pass the raw image for recognition (the model was
+                # trained on raw crops from --collect-crops).
+                return self._detect_paddleocr(
+                    preprocessed, offset_x, offset_y,
+                    raw_img=roi_img)
             return self._detect_paddleocr(preprocessed, offset_x, offset_y)
         elif self._ocr_engine == self.OCR_ENGINE_EASYOCR:
             preprocessed = self._preprocess_roi(roi_img)
@@ -2841,8 +2842,15 @@ class TextDetector:
         else:
             return self._detect_mser(roi_img, offset_x, offset_y)
 
-    def _detect_paddleocr(self, roi_img, offset_x, offset_y):
-        """Detect and recognize text using PaddleOCR (GPU-accelerated)."""
+    def _detect_paddleocr(self, roi_img, offset_x, offset_y,
+                          raw_img=None):
+        """Detect and recognize text using PaddleOCR (GPU-accelerated).
+
+        When *raw_img* is provided, use *roi_img* (preprocessed) for text
+        detection only, then run recognition on *raw_img* (the original
+        un-binarized crop).  This avoids feeding OTSU-binarized images
+        to a custom rec model that was trained on raw crops.
+        """
         if self._paddleocr_reader is None:
             lang = self.ocr_lang[0] if self.ocr_lang else "en"
             try:
@@ -2895,14 +2903,85 @@ class TextDetector:
         if not self._paddleocr_reader:
             return []
 
+        # --- Two-pass mode (custom rec model) ---
+        # Pass 1: detect text regions on the preprocessed image.
+        # Pass 2: recognize each crop from the raw (un-binarized) image.
+        if raw_img is not None:
+            try:
+                det_result = self._paddleocr_reader.ocr(
+                    roi_img, cls=False, rec=False)
+            except (IndexError, Exception):
+                det_result = None
+
+            if not det_result or not det_result[0]:
+                # Det found nothing on preprocessed image either —
+                # fall back to rec-only on the whole raw crop.
+                try:
+                    rec_result = self._paddleocr_reader.ocr(
+                        raw_img, cls=False, det=False)
+                except (IndexError, Exception):
+                    rec_result = None
+                if not rec_result or not rec_result[0]:
+                    if self.verbose:
+                        print("  [paddleocr] no det + no rec-only result",
+                              file=sys.stderr)
+                    return []
+                results = []
+                for item in rec_result[0]:
+                    text, conf = item
+                    if self.verbose:
+                        print(f"  [paddleocr] rec-only: '{text}' "
+                              f"conf={conf:.3f}", file=sys.stderr)
+                    if conf < self.min_confidence:
+                        continue
+                    h, w = raw_img.shape[:2]
+                    results.append({
+                        "text": text,
+                        "bbox": (offset_x, offset_y, w, h),
+                        "confidence": float(conf),
+                    })
+                return results
+
+            # Det found regions — run rec on each crop from raw_img
+            results = []
+            rh, rw = raw_img.shape[:2]
+            ph, pw = roi_img.shape[:2]
+            # Scale factor from preprocessed coords back to raw coords
+            sx = rw / pw if pw else 1
+            sy = rh / ph if ph else 1
+            for bbox_pts in det_result[0]:
+                xs = [int(p[0] * sx) for p in bbox_pts]
+                ys = [int(p[1] * sy) for p in bbox_pts]
+                x1, x2 = max(0, min(xs)), min(rw, max(xs))
+                y1, y2 = max(0, min(ys)), min(rh, max(ys))
+                if x2 <= x1 or y2 <= y1:
+                    continue
+                crop = raw_img[y1:y2, x1:x2]
+                try:
+                    rec_result = self._paddleocr_reader.ocr(
+                        crop, cls=False, det=False)
+                except (IndexError, Exception):
+                    continue
+                if not rec_result or not rec_result[0]:
+                    continue
+                text, conf = rec_result[0][0]
+                if self.verbose:
+                    print(f"  [paddleocr] det+rec: '{text}' "
+                          f"conf={conf:.3f}", file=sys.stderr)
+                if conf < self.min_confidence:
+                    continue
+                results.append({
+                    "text": text,
+                    "bbox": (offset_x + x1, offset_y + y1,
+                             x2 - x1, y2 - y1),
+                    "confidence": float(conf),
+                })
+            return results
+
+        # --- Standard single-pass mode ---
         try:
             result = self._paddleocr_reader.ocr(roi_img, cls=False)
         except IndexError:
-            # This happens when a training checkpoint (.pdparams) is passed
-            # as rec_model_dir instead of an exported inference model
-            # (.pdmodel + .pdiparams).  PaddleOCR silently falls back to
-            # the default model (97 classes) but uses the custom dict
-            # (fewer chars), causing an out-of-range index during decode.
             if not getattr(self, "_paddle_index_warned", False):
                 self._paddle_index_warned = True
                 print(
@@ -2917,16 +2996,7 @@ class TextDetector:
 
         results = []
         if not result or not result[0]:
-            if self.verbose and self._rec_model_dir:
-                print(f"  [paddleocr] no detections (raw result: {result})",
-                      file=sys.stderr)
             return results
-
-        if self.verbose and self._rec_model_dir:
-            for line in result[0]:
-                _bp, (_t, _c) = line
-                print(f"  [paddleocr] raw: '{_t}' conf={_c:.3f}",
-                      file=sys.stderr)
 
         for line in result[0]:
             bbox_pts, (text, conf) = line
