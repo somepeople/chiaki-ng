@@ -2917,7 +2917,16 @@ class TextDetector:
 
         results = []
         if not result or not result[0]:
+            if self.verbose and self._rec_model_dir:
+                print(f"  [paddleocr] no detections (raw result: {result})",
+                      file=sys.stderr)
             return results
+
+        if self.verbose and self._rec_model_dir:
+            for line in result[0]:
+                _bp, (_t, _c) = line
+                print(f"  [paddleocr] raw: '{_t}' conf={_c:.3f}",
+                      file=sys.stderr)
 
         for line in result[0]:
             bbox_pts, (text, conf) = line
