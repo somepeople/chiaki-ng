@@ -2889,7 +2889,25 @@ class TextDetector:
         if not self._paddleocr_reader:
             return []
 
-        result = self._paddleocr_reader.ocr(roi_img, cls=False)
+        try:
+            result = self._paddleocr_reader.ocr(roi_img, cls=False)
+        except IndexError:
+            # This happens when a training checkpoint (.pdparams) is passed
+            # as rec_model_dir instead of an exported inference model
+            # (.pdmodel + .pdiparams).  PaddleOCR silently falls back to
+            # the default model (97 classes) but uses the custom dict
+            # (fewer chars), causing an out-of-range index during decode.
+            if not getattr(self, "_paddle_index_warned", False):
+                self._paddle_index_warned = True
+                print(
+                    "[!] PaddleOCR IndexError: your rec_model_dir likely "
+                    "contains a training checkpoint, not an exported "
+                    "inference model.  Run PaddleOCR's export_model.py "
+                    "first, or remove --rec-model-dir / "
+                    "--rec-char-dict-path to use the default model.",
+                    file=sys.stderr,
+                )
+            return []
 
         results = []
         if not result or not result[0]:
